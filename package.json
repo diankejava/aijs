@@ -1,0 +1,12 @@
+{
+  "name": "doubao-chat-cli",
+  "version": "1.0.0",
+  "description": "CLI tool to chat with doubao.com/chat via Playwright",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}

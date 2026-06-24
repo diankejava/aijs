@@ -1,0 +1,17 @@
+{
+  "platforms": {
+    "doubao": {
+      "name": "豆包",
+      "url": "https://www.doubao.com/chat/",
+      "editor": "textarea[placeholder*=\"发消息\"]",
+      "sendButton": "button[type=\"submit\"][class*=\"rounded-full\"]"
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "url": "https://chat.deepseek.com/",
+      "editor": "textarea[placeholder*=\"DeepSeek\"]",
+      "sendButton": "div[role=\"button\"].ds-button--primary"
+    }
+  },
+  "default": "doubao"
+}
