@@ -334,11 +334,11 @@ async function main() {
       }
 
       // 3. 格式错误 → 进入重试循环（最多5次，包含首次共6次尝试）
-      const maxRetries = 5;
+      const maxRetries = 50;
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
         // 构造纠错消息，把具体错误告诉模型
-        prompt = `【可用工具】\n${toolsText}${instruction}\n\n【注意】输出格式有误：${parseResult.error}\n请严格按格式重新输出工具调用\n注意引号嵌套问题,引号里面有引号必须转义\n：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>`;
+        prompt = `【可用工具】\n${toolsText}${instruction}\n\n【注意】JSON解析是程序解析，解析失败必定是输出的格式有误：${parseResult.error}\n请严格按格式重新输出工具调用\n注意引号嵌套问题,引号里面有引号必须转义\n：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>`;
 
         reply = await sendAndWait(prompt);
         rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
