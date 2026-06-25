@@ -314,9 +314,9 @@ async function main() {
       }
     }
 
-    async function getFinalReplyWithTools(systemMsg, userMsg, toolsText, instruction) {
+    async function getFinalReplyWithTools(promptText, toolsText, instruction) {
       // 首次调用
-      let prompt = `【系统提示】\n${systemMsg}\n\n【可用工具】\n${toolsText}${instruction}\n\n【用户消息】\n${userMsg}`;
+      let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
       let reply = await sendAndWait(prompt);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
@@ -338,7 +338,7 @@ async function main() {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
         // 构造纠错消息，把具体错误告诉模型
-        prompt = `【可用工具】\n${toolsText}${instruction}\n\n【注意】JSON解析是程序解析，解析失败必定是输出的格式有误：${parseResult.error}\n请严格按格式重新输出工具调用\n注意引号嵌套问题,引号里面有引号必须转义\n：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>`;
+        prompt = `【可用工具】\n${toolsText}${instruction}\n\n【注意】JSON解析是程序解析，解析失败必定是输出的格式有误：${parseResult.error}\n请严格按格式重新输出工具调用\n调用工具一次只能一个，也就是只能一个<tool_call>，一个</tool_call>\n注意引号嵌套问题,引号里面有引号必须转义\n tool_call标签之间不能有真正的换行，可以使用斜杆n代替\n：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>`;
 
         reply = await sendAndWait(prompt);
         rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
@@ -372,12 +372,9 @@ async function main() {
           // console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', body);
           const data = JSON.parse(body);
           const messages = data.messages || [];
-          const systemMsg = messages.find(m => m.role === 'system')?.content || '';
           const userMsgs = messages.filter(m => m.role === 'user');
           let userMsg = userMsgs.length ? userMsgs[userMsgs.length - 1].content : '';
           const tools = data.tools || [];
-          const assistantMsgs = messages.filter(m => m.role === 'assistant');
-          const toolMsgs = messages.filter(m => m.role === 'tool');
 
           if (!userMsg) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -398,15 +395,18 @@ async function main() {
             return;
           }
 
-          if(assistantMsgs.length > 0){
-            for(let i = 0; i < assistantMsgs.length; i++){
-              userMsg += `\n\n【助手信息】\n${assistantMsgs[i].content}`;
-            }
-          }
-
-          if(toolMsgs.length > 0){
-            for(let i = 0; i < toolMsgs.length; i++){
-              userMsg += `\n\n【工具信息】\n${toolMsgs[i].content}`;
+          let promptText = "";
+          if(messages.length > 0){
+            for(let i = 0; i < messages.length; i++){
+              if(messages[i].role === 'system'){
+                promptText += `【系统提示】\n${messages[i].content}`;
+              }else if(messages[i].role === 'user'){
+                promptText += `【用户消息】\n${messages[i].content}`;
+              }else if(messages[i].role === 'assistant'){
+                promptText += `【模型回复】\n${messages[i].content}`;
+              }else if(messages[i].role === 'tool'){
+                promptText += `【工具信息】\n${messages[i].content}`;
+              }
             }
           }
 
@@ -417,11 +417,11 @@ async function main() {
             ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
             : '无';
           const toolCallInstructions = tools.length > 0
-            ? `\n\n当你需要使用工具时，请严格按以下格式输出，不要附带任何其他文字,注意tool_call之间必须是有效的json,而且必须是<tool_call>与</tool_call>同时出现：\n<tool_call>\n{"name": "<函数名>", "arguments": <参数JSON>}\n</tool_call>，当不需要使用工具时，直接输出你的文本回复`
+            ? `\n\n当你需要使用工具时，请严格按以下格式输出，不要附带任何其他文字,注意tool_call之间必须是有效的json,而且必须是<tool_call>与</tool_call>同时出现,调用工具一次只能一个，也就是只能一个<tool_call>，一个</tool_call>\n tool_call标签之间不能有真正的换行，可以使用斜杆n代替\n：\n<tool_call>\n{"name": "<函数名>", "arguments": <参数JSON>}\n</tool_call>，当不需要使用工具时，直接输出你的文本回复`
             : '';
 
           const { toolCall, rawOutput } = await getFinalReplyWithTools(
-            systemMsg, userMsg, toolsText, toolCallInstructions
+            promptText, toolsText, toolCallInstructions
           );
 
           const hasTool = !!toolCall;
