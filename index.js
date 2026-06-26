@@ -266,26 +266,22 @@ async function main() {
     }
 
     // 解析模型输出中的工具调用
-    function parseToolCall(text) {
-      const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/;
-      const match = text.match(regex);
+    function parseToolCall(text, allowedNames = []) {
+      const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+      const matches = [...text.matchAll(regex)];
+      
+      if (matches.length === 0) {
+          if (text.includes('tool_call')) {
+              return { found: true, success: false, error: '存在 <tool_call> 标签但无法解析' };
+          }
+          return { found: false, success: false, toolCall: null };
+      }
 
-      // 完全没有 <tool_call> 标签 → 正常，不调用工具
-      if (!match) {
-        if (text.includes('tool_call')){
-          return {
-            found: true,
-            success: false,
-            error: '模型输出中存在 <tool_call> 标签，但 JSON 解析失败'
-          };
-        }
-
-        return { found: false, error: null };
-      } 
+      // 只取最后一个
+      const lastMatch = matches[matches.length - 1];
         
-
       try {
-        const parsed = JSON.parse(match[1].trim());
+        const parsed = JSON.parse(lastMatch[1].trim());
         if (typeof parsed.name !== 'string' || parsed.name.length === 0) {
           return {
             found: true,
@@ -293,6 +289,7 @@ async function main() {
             error: 'JSON 中缺少有效的 "name" 字段，请确保 "name" 存在且不为空'
           };
         }
+
         if (typeof parsed.arguments !== 'object' || parsed.arguments === null) {
           return {
             found: true,
@@ -300,28 +297,44 @@ async function main() {
             error: '"arguments" 必须是一个 JSON 对象'
           };
         }
+
+        if (allowedNames.length > 0 && !allowedNames.includes(parsed.name)) {
+            return {
+                found: true,
+                success: false,
+                error: `无效的函数名 "${parsed.name}"，允许的函数名：${allowedNames.join(', ')}`
+            };
+        }
+
         return {
           found: true,
           success: true,
           toolCall: { name: parsed.name, arguments: parsed.arguments }
         };
       } catch (e) {
+        const snippet = lastMatch[1].trim().slice(0, 200);
         return {
           found: true,
           success: false,
-          error: `JSON ${text} \n解析失败: ${e.message}`
+          error: `JSON 解析失败：${e.message}。出错的 JSON 片段：${jsonSnippet.slice(0, 200)}`
         };
+        // return {
+        //   found: true,
+        //   success: false,
+        //   error: `JSON ${text} \n解析失败: ${e.message}`
+        // };
       }
     }
 
-    async function getFinalReplyWithTools(promptText, toolsText, instruction) {
+    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames = []) {
       // 首次调用
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
       let reply = await sendAndWait(prompt);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
+      const firstOutput = rawOutput;
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
 
-      let parseResult = parseToolCall(rawOutput);
+      let parseResult = parseToolCall(rawOutput,toolNames);
 
       // 1. 未找到工具调用 → 直接返回文本
       if (!parseResult.found) {
@@ -338,13 +351,17 @@ async function main() {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
         // 构造纠错消息，把具体错误告诉模型
-        prompt = `【可用工具】\n${toolsText}${instruction}\n\n【注意】JSON解析是程序解析，解析失败必定是输出的格式有误：${parseResult.error}\n请严格按格式重新输出工具调用\n调用工具一次只能一个，也就是只能一个<tool_call>，一个</tool_call>\n注意引号嵌套问题,引号里面有引号必须转义\n tool_call标签之间不能有真正的换行，可以使用斜杆n代替\n：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>`;
-
-        reply = await sendAndWait(prompt);
+        const retryPrompt = `${promptText}\n\n【工具格式纠正请求】\n` +
+    `上一轮你的工具调用 JSON 解析失败，错误信息：${parseResult.error}\n` +
+    `请根据原始用户需求，严格按下方格式重新输出唯一一段工具调用（不得包含其他文字）：\n` +
+    `<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>\n` +
+    `注意：只输出工具调用，不要添加任何其他内容。`;
+  
+        reply = await sendAndWait(retryPrompt);
         rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
         console.log('[HTTP] 纠正后输出:', rawOutput.slice(0, 150));
 
-        parseResult = parseToolCall(rawOutput);
+        parseResult = parseToolCall(rawOutput,toolNames);
 
         // 纠正后未找到工具调用 → 可能模型放弃使用工具，退回文本
         if (!parseResult.found) {
@@ -359,7 +376,7 @@ async function main() {
 
       // 重试用完仍失败，回退为普通文本（防止卡死）
       console.log('[ToolCall] 重试次数用尽，降级为纯文本回复');
-      return { toolCall: null, rawOutput };
+      return { toolCall: null, firstOutput };
     }
 
     // 原有的请求处理部分（仅展示核心修改）
@@ -375,6 +392,7 @@ async function main() {
           const userMsgs = messages.filter(m => m.role === 'user');
           let userMsg = userMsgs.length ? userMsgs[userMsgs.length - 1].content : '';
           const tools = data.tools || [];
+          const toolNames = tools.map(t => t.function.name);
 
           if (!userMsg) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -417,11 +435,24 @@ async function main() {
             ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
             : '无';
           const toolCallInstructions = tools.length > 0
-            ? `\n\n当你需要使用工具时，请严格按以下格式输出，不要附带任何其他文字,注意tool_call之间必须是有效的json,而且必须是<tool_call>与</tool_call>同时出现,调用工具一次只能一个，也就是只能一个<tool_call>，一个</tool_call>\n tool_call标签之间不能有真正的换行，可以使用斜杆n代替\n：\n<tool_call>\n{"name": "<函数名>", "arguments": <参数JSON>}\n</tool_call>，当不需要使用工具时，直接输出你的文本回复`
+            ? `【关键工具调用规则】
+- 当需要使用工具时，你必须输出**唯一**一段格式：
+  <tool_call>
+  {"name": "函数名", "arguments": {参数对象}}
+  </tool_call>
+- 整段内容不能包含任何其他文字、解释或换行，只能有一个 <tool_call> 对。
+- arguments 必须是合法的 JSON 对象，不能有多余的逗号。
+- 如果参数中有引号，必须用反斜杠转义，例如 "key": "他说 \\\"你好\\\""。
+- 绝对不要在 <tool_call> 和 </tool_call> 之间出现真实的换行符，如果有换行需求请用 \\n 代替。
+- 下面是一个正确示例：
+  <tool_call>
+  {"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}
+  </tool_call>
+  当不需要使用工具时，直接输出你的文本回复`
             : '';
 
           const { toolCall, rawOutput } = await getFinalReplyWithTools(
-            promptText, toolsText, toolCallInstructions
+            promptText, toolsText, toolCallInstructions,toolNames
           );
 
           const hasTool = !!toolCall;
