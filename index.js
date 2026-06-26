@@ -312,7 +312,7 @@ async function main() {
           toolCall: { name: parsed.name, arguments: parsed.arguments }
         };
       } catch (e) {
-        const snippet = lastMatch[1].trim().slice(0, 200);
+        const jsonSnippet = lastMatch[1].trim().slice(0, 200);
         return {
           found: true,
           success: false,
