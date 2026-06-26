@@ -236,6 +236,25 @@ async function main() {
       await editor.press('Enter');
     }
 
+    // 通过页面上下文检测超限提示（不依赖类名）
+    const isOverLimit = await page.evaluate(() => {
+        const spans = document.querySelectorAll('span');
+        // 同时匹配中英文超限关键字，且包含百分数
+        const regex = /(over limit|超出限制|超过限制|超出).*?\d+%/i;
+        for (const span of spans) {
+            const text = span.textContent.trim();
+            if (regex.test(text) && span.offsetParent !== null) { // 只检查可见元素
+                return text; // 返回实际文本，便于日志
+            }
+        }
+        return null;
+    });
+
+    if (isOverLimit) {
+        console.log(`\x1b[31m[ERROR] 检测到上下文超限: ${isOverLimit}\x1b[0m`);
+        return null; // 直接返回 null，由上层统一处理
+    }
+
     console.log('\x1b[35m[DEBUG] 进入 waitForReply\x1b[0m');
     const reply = await waitForReply();
     if (reply) {
