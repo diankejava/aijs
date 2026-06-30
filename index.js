@@ -175,9 +175,14 @@ async function main() {
     return null;
   }
 
-  async function sendAndWait(text) {
+  async function sendAndWait(text, cancelState = null) {
     console.log('\x1b[36m[DEBUG] === 发送消息 ===\x1b[0m');
     console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', text.slice(0, 100));
+
+    // 如果客户端已断开，立即停止
+    if (cancelState && cancelState.cancelled) {
+      throw new Error('客户端已断开连接，终止重试');
+    }
 
     const editor = await findEditor();
     if (!editor) {
@@ -190,7 +195,6 @@ async function main() {
         const expertBtn = page.locator('[role="radio"]:has-text("专家模式")');
         if (await expertBtn.count() > 0) {
           const isSelected = await expertBtn.evaluate(el => el.getAttribute('aria-checked') === 'true');
-          // console.log('[HTTP] 专家模式已选中:', isSelected);
           if (!isSelected) {
             await expertBtn.click();
             await page.waitForTimeout(500);
@@ -239,12 +243,11 @@ async function main() {
     // 通过页面上下文检测超限提示（不依赖类名）
     const isOverLimit = await page.evaluate(() => {
         const spans = document.querySelectorAll('span');
-        // 同时匹配中英文超限关键字，且包含百分数
         const regex = /(over limit|超出限制|超过限制|超出).*?\d+%/i;
         for (const span of spans) {
             const text = span.textContent.trim();
-            if (regex.test(text) && span.offsetParent !== null) { // 只检查可见元素
-                return text; // 返回实际文本，便于日志
+            if (regex.test(text) && span.offsetParent !== null) {
+                return text;
             }
         }
         return null;
@@ -252,7 +255,7 @@ async function main() {
 
     if (isOverLimit) {
         console.log(`\x1b[31m[ERROR] 检测到上下文超限: ${isOverLimit}\x1b[0m`);
-        return null; // 直接返回 null，由上层统一处理
+        return null;
     }
 
     console.log('\x1b[35m[DEBUG] 进入 waitForReply\x1b[0m');
@@ -263,7 +266,17 @@ async function main() {
       console.log('\x1b[32m[DEBUG] 前 200 字符:\x1b[0m', reply.slice(0, 200));
     } else {
       console.log('\x1b[31m[DEBUG] 未收到回复\x1b[0m');
-      return sendAndWait(text);
+      if (cancelState) {
+        if (cancelState.cancelled) {
+          throw new Error('客户端已断开连接，终止重试');
+        }
+        cancelState.retryCount = (cancelState.retryCount || 0) + 1;
+        if (cancelState.retryCount > 3) {
+          throw new Error('消息重试次数超过上限，可能模型无法正常回复');
+        }
+        console.log(`[DEBUG] 重试发送 (${cancelState.retryCount}/3)`);
+      }
+      return sendAndWait(text, cancelState);
     }
     return reply;
   }
@@ -345,55 +358,57 @@ async function main() {
       }
     }
 
-    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames = []) {
-      // 首次调用
+    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, cancelState) {
+      const hasTools = toolsText && toolsText !== '无';
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
-      let reply = await sendAndWait(prompt);
+      let reply = await sendAndWait(prompt, cancelState);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
       const firstOutput = rawOutput;
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
 
-      let parseResult = parseToolCall(rawOutput,toolNames);
+      let parseResult = parseToolCall(rawOutput, toolNames);
 
-      // 1. 未找到工具调用 → 直接返回文本
+      // 如果请求包含工具，但模型没有输出工具调用，则追加提示并重试（最多3次）
+      const maxNoToolRetries = 3;
+      let noToolAttempt = 0;
+      while (hasTools && !parseResult.found && noToolAttempt < maxNoToolRetries) {
+        noToolAttempt++;
+        console.log(`[ToolCall] 模型未输出工具调用，第 ${noToolAttempt}/${maxNoToolRetries} 次要求继续`);
+        const continuePrompt = `${rawOutput}\n\n【系统提示】如果任务尚未完成，请根据上述内容，立即输出下一步需要调用的工具，格式如下：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>\n只输出工具调用，不要加其他文字。如果任务已完成，请输出“任务已完成”。`;
+        reply = await sendAndWait(continuePrompt, cancelState);
+        rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
+        console.log('[HTTP] 继续后输出:', rawOutput.slice(0, 150));
+        parseResult = parseToolCall(rawOutput, toolNames);
+      }
+
+      // 此时若仍无工具调用，说明模型确实不想用工具，返回纯文本（finish_reason: stop）
       if (!parseResult.found) {
         return { toolCall: null, rawOutput };
       }
 
-      // 2. 格式正确 → 返回工具调用
-      if (parseResult.success) {
-        return { toolCall: parseResult.toolCall, rawOutput };
-      }
-
-      // 3. 格式错误 → 进入重试循环（最多5次，包含首次共6次尝试）
+      // 格式错误则进入纠正循环（与之前相同，最多50次）
       const maxRetries = 50;
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        if (parseResult.success) {
+          return { toolCall: parseResult.toolCall, rawOutput };
+        }
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
-        // 构造纠错消息，把具体错误告诉模型
         const retryPrompt = `${promptText}\n\n【工具格式纠正请求】\n` +
     `上一轮你的工具调用 JSON 解析失败，错误信息：${parseResult.error}\n` +
     `请根据原始用户需求，严格按下方格式重新输出唯一一段工具调用（不得包含其他文字）：\n` +
     `<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>\n` +
     `注意：只输出工具调用，不要添加任何其他内容。`;
   
-        reply = await sendAndWait(retryPrompt);
+        reply = await sendAndWait(retryPrompt, cancelState);
         rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
         console.log('[HTTP] 纠正后输出:', rawOutput.slice(0, 150));
 
-        parseResult = parseToolCall(rawOutput,toolNames);
-
-        // 纠正后未找到工具调用 → 可能模型放弃使用工具，退回文本
+        parseResult = parseToolCall(rawOutput, toolNames);
         if (!parseResult.found) {
           return { toolCall: null, rawOutput };
         }
-        // 纠正成功
-        if (parseResult.success) {
-          return { toolCall: parseResult.toolCall, rawOutput };
-        }
-        // 否则继续下一个纠正轮次
       }
 
-      // 重试用完仍失败，回退为普通文本（防止卡死）
       console.log('[ToolCall] 重试次数用尽，降级为纯文本回复');
       return { toolCall: null, firstOutput };
     }
@@ -402,8 +417,13 @@ async function main() {
     if (req.method === 'POST' && req.url === '/v1/chat/completions') {
       let body = '';
       req.on('data', chunk => body += chunk);
+      const cancelState = { cancelled: false, retryCount: 0 };
+      req.on('close', () => {
+        cancelState.cancelled = true;
+        console.log('[HTTP] 客户端已断开连接');
+      });
       req.on('end', async () => {
-        try {
+      try {
           console.log('\x1b[36m[DEBUG] === 收到请求 ===\x1b[0m');
           // console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', body);
           const data = JSON.parse(body);
@@ -645,8 +665,15 @@ async function main() {
 
         } catch (e) {
           console.log('[HTTP] 处理请求异常:', e.message);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
+          // 即使客户端断开，也尝试发送错误响应，避免挂起
+          try {
+            if (res.writable) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
+            }
+          } catch (_) {
+            // 无法写入（客户端已断），忽略
+          }
         }
       });
       return;
