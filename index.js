@@ -27,6 +27,7 @@ const rl = readline.createInterface({
 
 async function main() {
   console.log(`正在启动浏览器，打开 ${platform.name}...`);
+  let processingQueue = Promise.resolve();
 
   let storageState = null;
   if (fs.existsSync(storageStateFile)) {
@@ -135,40 +136,68 @@ async function main() {
 
   // 等待并精准提取最后一条 AI 回复（纯文本内容）
   async function waitForReply(timeout = 1200000) {
-    const startTime = Date.now();
     console.log('\x1b[35m[DEBUG] 等待最新 AI 回复完成...\x1b[0m');
+    const startTime = Date.now();
+    const pollInterval = 1000;
 
-    try {
-      // 等待最后一个消息项同时具备 AI 回复内容 和 操作栏(完成标志)
-      await page.waitForFunction(
-        () => {
+    while (Date.now() - startTime < timeout) {
+      // 不再主动检查 cancelState，让等待自然结束或超时
+      try {
+        const found = await page.evaluate(() => {
           const items = document.querySelectorAll('[data-virtual-list-item-key]');
           if (!items.length) return false;
           const last = items[items.length - 1];
-          return last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex');
-        },
-        { timeout }
-      );
-      console.log('\x1b[35m[DEBUG] 最新 AI 回复已完成\x1b[0m');
+          return !!(last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex'));
+        });
 
-      // 提取纯文本（只取 ds-assistant-message-main-content，过滤思考过程）
-      const reply = await page.evaluate(() => {
-        const items = document.querySelectorAll('[data-virtual-list-item-key]');
-        const last = items[items.length - 1];
-        const main = last.querySelector('.ds-assistant-message-main-content');
-        if (!main) return null;
-        let text = main.textContent.trim();
-        text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
-        if (text.includes('User:') || text.includes('Assistant:')) return '';
-        return text.length > 10 ? text : null;
-      });
+        if (found) {
+          console.log('\x1b[35m[DEBUG] 最新 AI 回复已完成\x1b[0m');
+          await page.waitForTimeout(300);
+          let reply = await page.evaluate(() => {
+              const items = document.querySelectorAll('[data-virtual-list-item-key]');
+              const last = items[items.length - 1];
+              const main = last.querySelector('.ds-assistant-message-main-content');
+              if (!main) return '';
 
-      if (reply) {
-        console.log('\x1b[32m[DEBUG] 成功提取回复，长度:\x1b[0m', reply.length);
-        return reply;
+              // 优先从 innerHTML 中提取 <tool_call> 标签，因为 DeepSeek 可能使用实体编码
+              const rawHTML = main.innerHTML;
+              const toolCallMatch = rawHTML.match(/&lt;tool_call&gt;([\s\S]*?)&lt;\/tool_call&gt;/i);
+              
+              // 直接使用 textContent 获取纯文本内容，避免 HTML 标签污染
+              let text = main.textContent.trim();
+
+              text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
+              if (text.includes('User:') || text.includes('Assistant:')) return '';
+              return text;
+          });
+
+          if (!reply) {
+            await page.waitForTimeout(500);
+            reply = await page.evaluate(() => {
+              const items = document.querySelectorAll('[data-virtual-list-item-key]');
+              const last = items[items.length - 1];
+              const main = last.querySelector('.ds-assistant-message-main-content');
+              if (!main) return '';
+              let text = main.textContent.trim();
+              text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
+              if (text.includes('User:') || text.includes('Assistant:')) return '';
+              return text;
+            });
+          }
+
+          console.log('\x1b[32m[DEBUG] 成功提取回复，长度:\x1b[0m', reply ? reply.length : 0);
+          return reply || '';
+        }
+      } catch (e) {
+        if (e.message && e.message.includes('Execution context')) {
+          console.log('\x1b[35m[DEBUG] 页面上下文失效，等待稳定...\x1b[0m');
+          await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+        } else {
+          console.log('\x1b[31m[DEBUG] 轮询异常:\x1b[0m', e.message);
+        }
       }
-    } catch (e) {
-      console.log('\x1b[31m[DEBUG] 等待或提取失败:\x1b[0m', e.message);
+
+      await page.waitForTimeout(pollInterval);
     }
 
     console.log('\x1b[31m[DEBUG] waitForReply 超时\x1b[0m');
@@ -178,11 +207,6 @@ async function main() {
   async function sendAndWait(text, cancelState = null) {
     console.log('\x1b[36m[DEBUG] === 发送消息 ===\x1b[0m');
     console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', text.slice(0, 100));
-
-    // 如果客户端已断开，立即停止
-    if (cancelState && cancelState.cancelled) {
-      throw new Error('客户端已断开连接，终止重试');
-    }
 
     const editor = await findEditor();
     if (!editor) {
@@ -207,9 +231,29 @@ async function main() {
     }
 
     // 将文本写入剪贴板
-    await page.evaluate(async (text) => {
-      await navigator.clipboard.writeText(text);
-    }, text);
+    // await page.evaluate(async (text) => {
+    //   await navigator.clipboard.writeText(text);
+    // }, text);
+    // 将文本写入剪贴板（确保页面聚焦）
+    for (let clipAttempt = 0; clipAttempt < 3; clipAttempt++) {
+      try {
+        await page.bringToFront();
+        await page.waitForTimeout(100);
+        await page.evaluate(async (text) => {
+          await navigator.clipboard.writeText(text);
+        }, text);
+        break;
+      } catch (clipErr) {
+        if (clipAttempt === 2) {
+          console.log('[HTTP] 剪贴板写入失败，改用 keyboard.insertText');
+          // 回退方案：直接用 insertText（不依赖剪贴板
+          await page.keyboard.insertText(text);
+        } else {
+          console.log('[HTTP] 剪贴板写入失败 (${clipAttempt + 1}/3)，重试...');
+          await page.waitForTimeout(500);
+        }
+      }
+    }
 
     await editor.click();
     await page.waitForTimeout(200);
@@ -230,7 +274,6 @@ async function main() {
     await page.keyboard.up('Control');
 
     await page.waitForTimeout(300);
-
     const sendBtn = await findSendButton();
     if (sendBtn) {
       console.log('\x1b[36m[DEBUG] 点击发送按钮\x1b[0m');
@@ -264,21 +307,11 @@ async function main() {
       console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
       console.log('\x1b[32m[DEBUG] 长度:\x1b[0m', reply.length);
       console.log('\x1b[32m[DEBUG] 前 200 字符:\x1b[0m', reply.slice(0, 200));
+      return reply;
     } else {
       console.log('\x1b[31m[DEBUG] 未收到回复\x1b[0m');
-      if (cancelState) {
-        if (cancelState.cancelled) {
-          throw new Error('客户端已断开连接，终止重试');
-        }
-        cancelState.retryCount = (cancelState.retryCount || 0) + 1;
-        if (cancelState.retryCount > 3) {
-          throw new Error('消息重试次数超过上限，可能模型无法正常回复');
-        }
-        console.log(`[DEBUG] 重试发送 (${cancelState.retryCount}/3)`);
-      }
-      return sendAndWait(text, cancelState);
+      return null;  // 不再递归重试
     }
-    return reply;
   }
 
   const server = http.createServer(async (req, res) => {
@@ -400,12 +433,21 @@ async function main() {
     `注意：只输出工具调用，不要添加任何其他内容。`;
   
         reply = await sendAndWait(retryPrompt, cancelState);
-        rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
+        if (reply && reply.trim()) {
+            rawOutput = reply.trim();
+        } else {
+            console.log('[ToolCall] 纠正请求未获得有效回复，保留上一轮输出');
+            // rawOutput 保持不变
+        }
         console.log('[HTTP] 纠正后输出:', rawOutput.slice(0, 150));
 
         parseResult = parseToolCall(rawOutput, toolNames);
         if (!parseResult.found) {
-          return { toolCall: null, rawOutput };
+            const firstParse = parseToolCall(firstOutput, toolNames);
+            if (firstParse.success) {
+                return { toolCall: firstParse.toolCall, rawOutput: firstOutput };
+            }
+            return { toolCall: null, rawOutput: firstOutput };
         }
       }
 
@@ -423,258 +465,268 @@ async function main() {
         console.log('[HTTP] 客户端已断开连接');
       });
       req.on('end', async () => {
-      try {
-          console.log('\x1b[36m[DEBUG] === 收到请求 ===\x1b[0m');
-          // console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', body);
-          const data = JSON.parse(body);
-          const messages = data.messages || [];
-          const userMsgs = messages.filter(m => m.role === 'user');
-          let userMsg = userMsgs.length ? userMsgs[userMsgs.length - 1].content : '';
-          const tools = data.tools || [];
-          const toolNames = tools.map(t => t.function.name);
-
-          if (!userMsg) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'No message content', type: 'invalid_request_error' } }));
-            return;
-          }
-          
-          // 防重放过滤器（保留）
-          if (userMsg.includes('User:') || userMsg.includes('Assistant:')) {
-            console.log('\x1b[31m[网关拦截] 检测到回流的对话历史，已拒绝:\x1b[0m', userMsg.slice(0, 80));
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              choices: [{
-                message: { role: 'assistant', content: '请求已被拦截，请勿发送包含对话历史的脏数据。' },
-                finish_reason: 'stop'
-              }]
-            }));
-            return;
-          }
-
-          let promptText = "";
-          if(messages.length > 0){
-            for(let i = 0; i < messages.length; i++){
-              if(messages[i].role === 'system'){
-                promptText += `【系统提示】\n${messages[i].content}`;
-              }else if(messages[i].role === 'user'){
-                promptText += `【用户消息】\n${messages[i].content}`;
-              }else if(messages[i].role === 'assistant'){
-                promptText += `【模型回复】\n${messages[i].content}`;
-              }else if(messages[i].role === 'tool'){
-                promptText += `【工具信息】\n${messages[i].content}`;
-              }
-            }
-          }
-
-
-          console.log('[HTTP] 收到消息:', userMsg.slice(0, 50), '...');
-
-          const toolsText = tools.length > 0
-            ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
-            : '无';
-          const toolCallInstructions = tools.length > 0
-            ? `【关键工具调用规则】
-- 当需要使用工具时，你必须输出**唯一**一段格式：
-  <tool_call>
-  {"name": "函数名", "arguments": {参数对象}}
-  </tool_call>
-- 整段内容不能包含任何其他文字、解释或换行，只能有一个 <tool_call> 对。
-- arguments 必须是合法的 JSON 对象，不能有多余的逗号。
-- 如果参数中有引号，必须用反斜杠转义，例如 "key": "他说 \\\"你好\\\""。
-- 绝对不要在 <tool_call> 和 </tool_call> 之间出现真实的换行符，如果有换行需求请用 \\n 代替。
-- 下面是一个正确示例：
-  <tool_call>
-  {"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}
-  </tool_call>
-  当不需要使用工具时，直接输出你的文本回复`
-            : '';
-
-          const { toolCall, rawOutput } = await getFinalReplyWithTools(
-            promptText, toolsText, toolCallInstructions,toolNames
-          );
-
-          const hasTool = !!toolCall;
-          const finishReason = hasTool ? 'tool_calls' : 'stop';
-
-          // ---- 流式响应（简单处理：工具调用时不流式，直接一次性返回；纯文本保持原逻辑）----
-          if (data.stream === true) {
-            res.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive'
-            });
-
-            const chunkId = 'chatcmpl-' + Date.now();
-            const model = 'deepseek-chat';
-
-            // 1. 发送第一个 delta，包含 role
-            const firstChunk = {
-              id: chunkId,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{
-                index: 0,
-                delta: { role: 'assistant', content: null },
-                finish_reason: null
-              }]
-            };
-            res.write(`data: ${JSON.stringify(firstChunk)}\n\n`);
-
-            if (hasTool) {
-              // 2. 工具调用流式发送
-              const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
-              const argsStr = JSON.stringify(toolCall.arguments);
-
-              // 发送 tool_call 开始块（name + 空的 arguments）
-              const toolStartChunk = {
-                id: chunkId,
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [{
-                  index: 0,
-                  delta: {
-                    tool_calls: [{
-                      index: 0,
-                      id: toolCallId,
-                      type: 'function',
-                      function: {
-                        name: toolCall.name,
-                        arguments: ''
-                      }
-                    }]
-                  },
-                  finish_reason: null
-                }]
-              };
-              res.write(`data: ${JSON.stringify(toolStartChunk)}\n\n`);
-
-              // 逐步发送 arguments（可以按字符或分块发送）
-              for (let i = 0; i < argsStr.length; i++) {
-                const argChunk = {
-                  id: chunkId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [{
-                    index: 0,
-                    delta: {
-                      tool_calls: [{
-                        index: 0,
-                        function: {
-                          arguments: argsStr[i]
-                        }
-                      }]
-                    },
-                    finish_reason: null
-                  }]
-                };
-                res.write(`data: ${JSON.stringify(argChunk)}\n\n`);
-                await new Promise(r => setTimeout(r, 5)); // 模拟流式延迟
-              }
-
-              // 最后发送 finish_reason
-              const finalChunk = {
-                id: chunkId,
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [{
-                  index: 0,
-                  delta: {},
-                  finish_reason: 'tool_calls'
-                }]
-              };
-              res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-            } else {
-              // 3. 普通文本流式输出（保留你原来的逐字发送逻辑）
-              const words = rawOutput.split('');
-              for (let i = 0; i < words.length; i++) {
-                const chunk = {
-                  id: chunkId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [{
-                    index: 0,
-                    delta: { content: words[i] },
-                    finish_reason: null
-                  }]
-                };
-                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                await new Promise(r => setTimeout(r, 20));
-              }
-              const finalChunk = {
-                id: chunkId,
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [{
-                  index: 0,
-                  delta: {},
-                  finish_reason: 'stop'
-                }]
-              };
-              res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-            }
-
-            res.write('data: [DONE]\n\n');
-            res.end();
-            return;
-          }
-
-          // ---- 非流式响应 ----
-          const response = {
-            id: 'chatcmpl-' + Date.now(),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: 'deepseek-chat',
-            choices: [{
-              index: 0,
-              message: {},
-              finish_reason: finishReason
-            }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-          };
-
-          if (hasTool) {
-            const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
-            response.choices[0].message = {
-              role: 'assistant',
-              content: null,
-              tool_calls: [{
-                id: toolCallId,
-                type: 'function',
-                function: {
-                  name: toolCall.name,
-                  arguments: JSON.stringify(toolCall.arguments)
-                }
-              }]
-            };
-          } else {
-            response.choices[0].message = {
-              role: 'assistant',
-              content: rawOutput
-            };
-          }
-
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(response));
-
-        } catch (e) {
-          console.log('[HTTP] 处理请求异常:', e.message);
-          // 即使客户端断开，也尝试发送错误响应，避免挂起
+        // 将处理加入队列，确保串行
+        processingQueue = processingQueue.then(async () => {
           try {
-            if (res.writable) {
-              res.writeHead(500, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
+              console.log('\x1b[36m[DEBUG] === 收到请求 ===\x1b[0m');
+              // console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', body);
+              const data = JSON.parse(body);
+              const messages = data.messages || [];
+              const userMsgs = messages.filter(m => m.role === 'user');
+              let userMsg = userMsgs.length ? userMsgs[userMsgs.length - 1].content : '';
+              const tools = data.tools || [];
+              const toolNames = tools.map(t => t.function.name);
+
+              if (!userMsg) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'No message content', type: 'invalid_request_error' } }));
+                return;
+              }
+              
+              // 防重放过滤器（保留）
+              if (userMsg.includes('User:') || userMsg.includes('Assistant:')) {
+                console.log('\x1b[31m[网关拦截] 检测到回流的对话历史，已拒绝:\x1b[0m', userMsg.slice(0, 80));
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                  choices: [{
+                    message: { role: 'assistant', content: '请求已被拦截，请勿发送包含对话历史的脏数据。' },
+                    finish_reason: 'stop'
+                  }]
+                }));
+                return;
+              }
+
+              let promptText = "";
+              if(messages.length > 0){
+                for(let i = 0; i < messages.length; i++){
+                  if(messages[i].role === 'system'){
+                    promptText += `【系统提示】\n${messages[i].content}`;
+                  }else if(messages[i].role === 'user'){
+                    promptText += `【用户消息】\n${messages[i].content}`;
+                  }else if(messages[i].role === 'assistant'){
+                    promptText += `【模型回复】\n${messages[i].content}`;
+                  }else if(messages[i].role === 'tool'){
+                    promptText += `【工具信息】\n${messages[i].content}`;
+                  }
+                }
+              }
+
+
+              console.log('[HTTP] 收到消息:', userMsg.slice(0, 50), '...');
+
+              const toolsText = tools.length > 0
+                ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
+                : '无';
+              const toolCallInstructions = tools.length > 0
+                ? `【关键工具调用规则】
+    - 当需要使用工具时，你必须输出**唯一**一段格式：
+      <tool_call>
+      {"name": "函数名", "arguments": {参数对象}}
+      </tool_call>
+    - 整段内容不能包含任何其他文字、解释或换行，只能有一个 <tool_call> 对。
+    - arguments 必须是合法的 JSON 对象，不能有多余的逗号。
+    - 如果参数中有引号，必须用反斜杠转义，例如 "key": "他说 \\\"你好\\\""。
+    - 绝对不要在 <tool_call> 和 </tool_call> 之间出现真实的换行符，如果有换行需求请用 \\n 代替。
+    - 下面是一个正确示例：
+      <tool_call>
+      {"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}
+      </tool_call>
+      当不需要使用工具时，直接输出你的文本回复`
+                : '';
+
+              const { toolCall, rawOutput } = await getFinalReplyWithTools(
+                promptText, toolsText, toolCallInstructions,toolNames,cancelState
+              );
+
+              const hasTool = !!toolCall;
+              const finishReason = hasTool ? 'tool_calls' : 'stop';
+
+              // ---- 流式响应（简单处理：工具调用时不流式，直接一次性返回；纯文本保持原逻辑）----
+              if (data.stream === true) {
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive'
+                });
+
+                const chunkId = 'chatcmpl-' + Date.now();
+                const model = 'deepseek-chat';
+
+                // 1. 发送第一个 delta，包含 role
+                const firstChunk = {
+                  id: chunkId,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [{
+                    index: 0,
+                    delta: { role: 'assistant', content: null },
+                    finish_reason: null
+                  }]
+                };
+                res.write(`data: ${JSON.stringify(firstChunk)}\n\n`);
+
+                if (hasTool) {
+                  // 2. 工具调用流式发送
+                  const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
+                  const argsStr = JSON.stringify(toolCall.arguments);
+
+                  // 发送 tool_call 开始块（name + 空的 arguments）
+                  const toolStartChunk = {
+                    id: chunkId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: {
+                        tool_calls: [{
+                          index: 0,
+                          id: toolCallId,
+                          type: 'function',
+                          function: {
+                            name: toolCall.name,
+                            arguments: ''
+                          }
+                        }]
+                      },
+                      finish_reason: null
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(toolStartChunk)}\n\n`);
+
+                  // 逐步发送 arguments（可以按字符或分块发送）
+                  for (let i = 0; i < argsStr.length; i++) {
+                    const argChunk = {
+                      id: chunkId,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: model,
+                      choices: [{
+                        index: 0,
+                        delta: {
+                          tool_calls: [{
+                            index: 0,
+                            function: {
+                              arguments: argsStr[i]
+                            }
+                          }]
+                        },
+                        finish_reason: null
+                      }]
+                    };
+                    res.write(`data: ${JSON.stringify(argChunk)}\n\n`);
+                    await new Promise(r => setTimeout(r, 5)); // 模拟流式延迟
+                  }
+
+                  // 最后发送 finish_reason
+                  const finalChunk = {
+                    id: chunkId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: {},
+                      finish_reason: 'tool_calls'
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                } else {
+                  // 3. 普通文本流式输出（保留你原来的逐字发送逻辑）
+                  const words = rawOutput.split('');
+                  for (let i = 0; i < words.length; i++) {
+                    const chunk = {
+                      id: chunkId,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: model,
+                      choices: [{
+                        index: 0,
+                        delta: { content: words[i] },
+                        finish_reason: null
+                      }]
+                    };
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                    await new Promise(r => setTimeout(r, 20));
+                  }
+                  const finalChunk = {
+                    id: chunkId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: {},
+                      finish_reason: 'stop'
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                }
+
+                res.write('data: [DONE]\n\n');
+                res.end();
+                return;
+              }
+
+              // ---- 非流式响应 ----
+              const response = {
+                id: 'chatcmpl-' + Date.now(),
+                object: 'chat.completion',
+                created: Math.floor(Date.now() / 1000),
+                model: 'deepseek-chat',
+                choices: [{
+                  index: 0,
+                  message: {},
+                  finish_reason: finishReason
+                }],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+              };
+
+              if (hasTool) {
+                const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
+                response.choices[0].message = {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [{
+                    id: toolCallId,
+                    type: 'function',
+                    function: {
+                      name: toolCall.name,
+                      arguments: JSON.stringify(toolCall.arguments)
+                    }
+                  }]
+                };
+              } else {
+                response.choices[0].message = {
+                  role: 'assistant',
+                  content: rawOutput
+                };
+              }
+
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(response));
+
+            } catch (e) {
+              // 如果是客户端主动断开导致的异常，静默丢弃，不发送任何响应
+              if (cancelState.cancelled) {
+                console.log('[HTTP] 客户端已断开连接，终止处理');
+                return;
+              }
+              console.log('[HTTP] 处理请求异常:', e.message);
+              // 即使客户端断开，也尝试发送错误响应，避免挂起
+              try {
+                if (res.writable) {
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
+                }
+              } catch (_) {
+                // 无法写入（客户端已断），忽略
+              }
             }
-          } catch (_) {
-            // 无法写入（客户端已断），忽略
-          }
-        }
+        }).catch(e => {
+          console.error('[队列] 未捕获异常:', e.message);
+        });
       });
       return;
     }
