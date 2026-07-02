@@ -438,9 +438,20 @@ async function main() {
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
         const retryPrompt = `${promptText}\n\n【工具格式纠正请求】\n` +
     `上一轮你的工具调用 JSON 解析失败，错误信息：${parseResult.error}\n` +
-    `请根据原始用户需求，严格按下方格式重新输出唯一一段工具调用（不得包含其他文字）：\n` +
-    `<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>\n` +
-    `注意：只输出工具调用，不要添加任何其他内容。`;
+    `【关键工具调用规则】
+    - 当需要使用工具时，你必须输出**唯一**一段格式：
+      <tool_call>
+      {"name": "函数名", "arguments": {参数对象}}
+      </tool_call>
+    - 整段内容不能包含任何其他文字、解释或换行，只能有一个 <tool_call> 对。
+    - arguments 必须是合法的 JSON 对象，不能有多余的逗号。
+    - 如果参数中有引号，必须用反斜杠转义，例如 "key": "他说 \\\"你好\\\""或者包裹你好的双引号可以改成中文的双引号如”，有双引号可以先写外面的双引号，然后判断要写在这个双引号里面的是否有双引号，如有则进行转义。
+    - 绝对不要在 <tool_call> 和 </tool_call> 之间出现真实的换行符，如果有换行需求请用 \\n 代替。
+    - 下面是一个正确示例：
+      <tool_call>
+      {"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}
+      </tool_call>
+      当不需要使用工具时，直接输出你的文本回复`;
   
         reply = await sendAndWait(retryPrompt, cancelState);
         if (reply && reply.trim()) {
