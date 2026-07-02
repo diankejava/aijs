@@ -330,6 +330,21 @@ async function main() {
       return;
     }
 
+    function safeJsonParse(text) {
+      // 1. 将字符串值内的真实换行替换为 \n
+      // 原理：用占位符保护字符串边界，正则匹配双引号包裹的内容
+      let safeText = text.replace(/"((?:[^"\\]|\\.)*)"/g, (match, content) => {
+        // 将内容里的真实换行、回车等转为转义形式
+        const escaped = content
+          .replace(/\n/g, '\\n')
+          .replace(/\r/g, '\\r')
+          .replace(/\t/g, '\\t');
+        return `"${escaped}"`;
+      });
+      // 还可以进一步处理未转义的英文双引号等（此处略）
+      return JSON.parse(safeText);
+    }
+
     // 解析模型输出中的工具调用
     function parseToolCall(text, allowedNames = []) {
       const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
@@ -337,7 +352,7 @@ async function main() {
       
       if (matches.length === 0) {
           if (text.includes('tool_call')) {
-              return { found: true, success: false, error: '存在 <tool_call> 标签但无法解析' };
+              return { found: true, success: false, error: '存在 <tool_call> 标签但无法解析，注意<tool_call>标签中没有任何属性' };
           }
           return { found: false, success: false, toolCall: null };
       }
@@ -346,7 +361,7 @@ async function main() {
       const lastMatch = matches[matches.length - 1];
         
       try {
-        const parsed = JSON.parse(lastMatch[1].trim());
+        const parsed = safeJsonParse(lastMatch[1].trim());
         if (typeof parsed.name !== 'string' || parsed.name.length === 0) {
           return {
             found: true,
@@ -381,13 +396,8 @@ async function main() {
         return {
           found: true,
           success: false,
-          error: `JSON 解析失败：${e.message}。出错的 JSON 片段：${jsonSnippet.slice(0, 200)}`
+          error: `JSON 解析失败：${e.message}。出错的 JSON 片段：${jsonSnippet.slice(0, 500)}`
         };
-        // return {
-        //   found: true,
-        //   success: false,
-        //   error: `JSON ${text} \n解析失败: ${e.message}`
-        // };
       }
     }
 
