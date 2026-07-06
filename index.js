@@ -656,7 +656,7 @@ async function main() {
     示例："key": "他说 \"你好\"" 或 "key": "他说 “你好”"。
     若参数值需要包含换行，请使用转义序列 \n，绝对不要在 JSON 字符串内出现真实的换行符。
     正确示例：
-    <tool_call>{"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}</tool_call>
+    <tool_call>{"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}</tool_call>,如果比较困难，可以尝试缩小更新范围，或者尝试使用更简单的工具。
     当不需要使用工具时，直接输出你的文本回复。`;
 
         reply = await sendAndWait(retryPrompt, cancelState);
@@ -750,18 +750,19 @@ async function main() {
               return;
             }
 
+            const MAX_HISTORY = 20;
+            const recentMessages = messages.slice(-MAX_HISTORY);
             let promptText = "";
-            if(messages.length > 0){
-              for(let i = 0; i < messages.length; i++){
-                if(messages[i].role === 'system'){
-                  promptText += `【系统提示】\n${messages[i].content}`;
-                }else if(messages[i].role === 'user'){
-                  promptText += `【用户消息】\n${messages[i].content}`;
-                }else if(messages[i].role === 'assistant'){
-                  promptText += `【模型回复】\n${messages[i].content}`;
-                }else if(messages[i].role === 'tool'){
-                  promptText += `【工具信息】\n${messages[i].content}`;
-                }
+            for (const msg of recentMessages) {
+              const content = (msg.content || '').slice(0, 2000); // 防止单条消息过长
+              if (msg.role === 'system') {
+                promptText += `【系统提示】\n${content}`;
+              } else if (msg.role === 'user') {
+                promptText += `【用户消息】\n${content}`;
+              } else if (msg.role === 'assistant') {
+                promptText += `【模型回复】\n${content}`;
+              } else if (msg.role === 'tool') {
+                promptText += `【工具信息】\n${content}`;
               }
             }
 
@@ -888,21 +889,20 @@ async function main() {
                 res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
               } else {
                 // 3. 普通文本流式输出（保留你原来的逐字发送逻辑）
-                const words = rawOutput.split('');
-                for (let i = 0; i < words.length; i++) {
-                  const chunk = {
-                    id: chunkId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: { content: words[i] },
-                      finish_reason: null
-                    }]
-                  };
-                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                  await new Promise(r => setTimeout(r, 20));
+                for (const char of rawOutput) {
+                    const chunk = {
+                        id: chunkId,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [{
+                            index: 0,
+                            delta: { content: char },
+                            finish_reason: null
+                        }]
+                    };
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                    await new Promise(r => setTimeout(r, 20));
                 }
                 const finalChunk = {
                   id: chunkId,
