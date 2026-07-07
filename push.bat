@@ -26,8 +26,8 @@ if %errorlevel% equ 0 (
     echo [SUCCESS] 推送成功！
     goto end
 ) else (
-    echo [FAIL] 推送失败，等待 10 秒后重试...
-    timeout /t 10 /nobreak >nul
+    echo [FAIL] 推送失败，等待 1 秒后重试...
+    timeout /t 1 /nobreak >nul
     goto loop
 )
 
