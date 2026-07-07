@@ -253,7 +253,7 @@ async function main() {
       }
     }
 
-    // ========== 稳健输入策略：优先剪贴板粘贴，降级为 DOM 注入 + 强事件模拟 ==========
+    // ========== 稳健输入策略：优先 insertText，降级为增强 DOM 注入（支持换行） ==========
     await editor.click();
     await page.waitForTimeout(200);
 
@@ -266,49 +266,46 @@ async function main() {
       await editor.fill('');
     }
 
-    let pasteSuccess = false;
-    // 尝试剪贴板粘贴（能完美保留 \n，且触发框架更新）
-    for (let clipAttempt = 0; clipAttempt < 3; clipAttempt++) {
-      try {
-        await page.bringToFront();
-        await page.waitForTimeout(100);
-        await page.evaluate(async (t) => {
-          await navigator.clipboard.writeText(t);
-        }, text);
-        // 模拟 Ctrl+V 粘贴
-        await page.keyboard.down('Control');
-        await page.keyboard.press('KeyV');
-        await page.keyboard.up('Control');
-        pasteSuccess = true;
-        break;
-      } catch (e) {
-        if (clipAttempt < 2) {
-          console.log(`[HTTP] 剪贴板写入失败 (${clipAttempt + 1}/3)，重试...`);
-          await page.waitForTimeout(500);
-        }
-      }
+    let inputSuccess = false;
+    try {
+      // 方法1：使用 keyboard.insertText，不通过剪贴板，直接输入字符（包括换行）
+      // 该 API 会逐字符派发 input 事件，完美兼容 React/Vue 且不会触发 Enter 发送
+      await page.keyboard.insertText(text);
+      inputSuccess = true;
+      console.log('[HTTP] 使用 keyboard.insertText 输入成功');
+    } catch (e) {
+      console.log('[HTTP] insertText 失败，尝试增强 DOM 注入:', e.message);
     }
 
-    if (!pasteSuccess) {
-      console.log('[HTTP] 剪贴板方案失败，改用 DOM 注入 + 强化事件模拟');
-      // 降级：直接设置文本，并派发足够多的事件让 React/Vue 感知
+    if (!inputSuccess) {
+      // 方法2：增强 DOM 注入 —— 将 \n 转为 <br> 元素，并派发事件
+      console.log('[HTTP] 执行增强 DOM 注入（支持换行）');
       await editor.evaluate((el, t) => {
         const isRichEl = el.getAttribute('contenteditable') === 'true' || el.tagName.toLowerCase() === 'div';
         if (isRichEl) {
-          el.textContent = t;
+          // 清空并分行插入文本节点和 <br>
+          el.innerHTML = '';
+          const lines = t.split('\n');
+          for (let i = 0; i < lines.length; i++) {
+            el.appendChild(document.createTextNode(lines[i]));
+            if (i < lines.length - 1) {
+              el.appendChild(document.createElement('br'));
+            }
+          }
         } else {
+          // 普通 input/textarea
           el.value = t;
         }
-        // 派发多种事件，确保框架更新
+        // 派发多种事件，确保框架感知变化
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
         el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true }));
         el.dispatchEvent(new CompositionEvent('compositionend', { data: t, bubbles: true }));
       }, text);
-      // 短暂等待框架状态同步
+      // 短暂等待框架同步
       await page.waitForTimeout(400);
     } else {
-      await page.waitForTimeout(300); // 粘贴后等待渲染
+      await page.waitForTimeout(300); // insertText 后等待渲染
     }
 
     // 等待发送按钮变为可用（最多等待 3 秒）
@@ -502,7 +499,7 @@ async function main() {
           } catch (e) {
               results.push({
                   success: false,
-                  error: `JSON 解析失败：${e.message}。出错的 JSON 片段：${jsonStr.slice(0, 500)}`
+                  error: `JSON 解析失败：${e.message}。出错的 JSON 片段：${jsonStr}`
               });
               continue;
           }
@@ -612,7 +609,7 @@ async function main() {
         const continuePrompt = `${rawOutput}\n\n【系统提示】如果任务尚未完成，请根据上述内容，立即输出下一步需要调用的工具，格式如下：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>\n只输出工具调用，不要加其他文字。如果任务已完成，请输出“任务已完成”。`;
         reply = await sendAndWait(continuePrompt, cancelState);
         rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
-        console.log('[HTTP] 继续后输出:', rawOutput.slice(0, 150));
+        console.log('[HTTP] 继续后输出:', rawOutput);
 
         // 检查是否输出了“任务已完成”
         if (rawOutput.includes('任务已完成')) {
@@ -645,19 +642,17 @@ async function main() {
           return { toolCall: parseResult.toolCall, rawOutput };
         }
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
-        const retryPrompt = `${promptText}\n\n【工具格式纠正请求】\n` +
+        const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用】\n` +
           `上一轮你的工具调用 JSON 解析失败，错误信息：${parseResult.error}\n` +
-          `【关键工具调用规则】
-    当需要调用工具时，你必须只输出一个 <tool_call> 块，整个回复不能包含任何其他文字、解释或多余的换行。
-    <tool_call> 块必须写在同一行（标签与 JSON 之间不可换行），格式为：
-    <tool_call>{"name": "函数名", "arguments": {参数对象}}</tool_call>
-    arguments 必须是合法的 JSON 对象，不能有多余的逗号，键和字符串值必须用双引号包围。
-    若参数值内部包含双引号，必须用反斜杠转义（\"），或改用中文双引号 “ ” 以避免转义。
-    示例："key": "他说 \"你好\"" 或 "key": "他说 “你好”"。
-    若参数值需要包含换行，请使用转义序列 \n，绝对不要在 JSON 字符串内出现真实的换行符。
-    正确示例：
-    <tool_call>{"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}</tool_call>,如果比较困难，可以尝试缩小更新范围，或者尝试使用更简单的工具。
-    当不需要使用工具时，直接输出你的文本回复。`;
+          `【你必须严格遵循以下格式，整个回复只能有一行，不能有其他内容】
+  - 立即输出正确格式的工具调用：
+    <tool_call>{"name": "函数名", "arguments": {合法JSON对象}}</tool_call>
+  - 要求：
+    1. <tool_call> 与 { 之间不能有空格或换行。
+    2. JSON 内所有字符串用双引号，内含的双引号用 \\\" 转义。
+    3. 参数中如需表示换行，请使用 \\n 转义，不要输入真实换行。
+    4. 不要输出任何解释、道歉或额外文字，只输出这一行。
+  如果任务已完成，请输出“任务已完成”。`;
 
         reply = await sendAndWait(retryPrompt, cancelState);
         if (reply && reply.trim()) {
@@ -707,7 +702,7 @@ async function main() {
         cancelState.cancelled = true;
         console.log('[HTTP] 客户端已断开连接');
       });
-            const MAX_QUEUE_SIZE = 5; // 最多允许排队的请求数
+      const MAX_QUEUE_SIZE = 5; // 最多允许排队的请求数
       const TASK_TIMEOUT = 5 * 60 * 1000; // 单个任务总体超时 5 分钟
 
       req.on('end', () => {
@@ -773,20 +768,24 @@ async function main() {
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
             const toolCallInstructions = tools.length > 0
-              ? `【关键工具调用规则】
-  - 当需要使用工具时，你必须输出**唯一**一段格式：
-    <tool_call>
-    {"name": "函数名", "arguments": {参数对象}}
-    </tool_call>
-  - 整段内容不能包含任何其他文字、解释或换行，只能有一个 <tool_call> 对。
-  - arguments 必须是合法的 JSON 对象，不能有多余的逗号。
-  - 如果参数中有引号，必须用反斜杠转义，例如 "key": "他说 \\\"你好\\\""。
-  - 绝对不要在 <tool_call> 和 </tool_call> 之间出现真实的换行符，如果有换行需求请用 \\n 代替。
-  - 下面是一个正确示例：
-    <tool_call>
-    {"name": "search", "arguments": {"query": "今天天气如何", "max_results": 5}}
-    </tool_call>
-    当不需要使用工具时，直接输出你的文本回复`
+              ? `【关键工具调用规则 - 必须严格遵守】
+  - 当你需要调用工具时，整个回复只能包含一个 <tool_call> 块，不能有任何其他文字、解释或换行。
+  - <tool_call> 必须紧贴 JSON，中间不能有任何字符（包括换行）。
+  - JSON 对象必须合法：使用双引号，不能有多余逗号，所有字符串内的双引号必须用反斜杠转义（\\\"）。
+  - 若参数值包含换行，请使用 \\n 转义序列，绝对不要输入真实的换行符。
+  - 正确格式（单行，紧贴）：
+    <tool_call>{"name": "函数名", "arguments": {参数对象}}</tool_call>
+
+  【错误示例（绝对禁止）】
+  1. 在 <tool_call> 和 JSON 之间换行或加空格：<tool_call> {"name":...}
+  2. 在 JSON 内部包含真实换行：{"content": "第一行\n第二行"}  ← 这是错误的（应写为 \\\\n）
+  3. 在 <tool_call> 之外附加文字：好的，我将调用工具...<tool_call>...
+  4. 使用中文引号或单引号
+
+  【正确示例（仅此一种）】
+  <tool_call>{"name": "search", "arguments": {"query": "今天天气如何"}}</tool_call>
+
+  如果不需要使用工具，直接输出文本回复。`
               : '';
 
             const { toolCall, rawOutput } = await getFinalReplyWithTools(
@@ -796,62 +795,141 @@ async function main() {
             const hasTool = !!toolCall;
             const finishReason = hasTool ? 'tool_calls' : 'stop';
 
+            // 检查工具参数大小，防止超大响应导致 RangeError（包括序列化自身失败）
+            const MAX_ARG_SIZE = 512 * 1024; // 512 KB
+            if (hasTool) {
+              let argsStr;
+              try {
+                argsStr = JSON.stringify(toolCall.arguments);
+              } catch (serializeErr) {
+                console.log(`[HTTP] 工具参数序列化失败: ${serializeErr.message}，拒绝生成响应`);
+                const errorResponse = {
+                  id: 'chatcmpl-' + Date.now(),
+                  object: 'chat.completion',
+                  created: Math.floor(Date.now() / 1000),
+                  model: 'deepseek-chat',
+                  choices: [{
+                    index: 0,
+                    message: {
+                      role: 'assistant',
+                      content: '工具参数过大无法处理，请要求 AI 使用更小的参数或拆分步骤。'
+                    },
+                    finish_reason: 'stop'
+                  }],
+                  usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                };
+                if (res.writable) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify(errorResponse));
+                } else {
+                  console.log('[HTTP] 参数序列化失败且连接不可写，丢弃结果');
+                }
+                return;
+              }
+
+              if (argsStr.length > MAX_ARG_SIZE) {
+                console.log(`[HTTP] 工具参数过大 (${argsStr.length} bytes)，拒绝生成响应`);
+                const errorResponse = {
+                  id: 'chatcmpl-' + Date.now(),
+                  object: 'chat.completion',
+                  created: Math.floor(Date.now() / 1000),
+                  model: 'deepseek-chat',
+                  choices: [{
+                    index: 0,
+                    message: {
+                      role: 'assistant',
+                      content: `工具参数过大，无法返回（${(argsStr.length / 1024).toFixed(1)} KB）。请要求 AI 使用更小的参数或拆分步骤。`
+                    },
+                    finish_reason: 'stop'
+                  }],
+                  usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                };
+                if (res.writable) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify(errorResponse));
+                } else {
+                  console.log('[HTTP] 参数过大且连接不可写，丢弃结果');
+                }
+                return;
+              }
+            }
+
             // ---- 流式响应（简单处理：工具调用时不流式，直接一次性返回；纯文本保持原逻辑）----
             if (data.stream === true) {
+              // 先设置响应头
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive'
               });
 
+              // 监听响应流异常/关闭
+              let responseEnded = false;
+              const markEnded = (reason) => {
+                if (!responseEnded) {
+                  responseEnded = true;
+                  console.log(`[HTTP] 响应流中断: ${reason}`);
+                }
+              };
+              res.on('error', (err) => markEnded(`error: ${err.message}`));
+              res.on('close', () => markEnded('close'));
+
               const chunkId = 'chatcmpl-' + Date.now();
               const model = 'deepseek-chat';
 
               // 1. 发送第一个 delta，包含 role
-              const firstChunk = {
-                id: chunkId,
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [{
-                  index: 0,
-                  delta: { role: 'assistant', content: null },
-                  finish_reason: null
-                }]
-              };
-              res.write(`data: ${JSON.stringify(firstChunk)}\n\n`);
-
-              if (hasTool) {
-                // 2. 工具调用流式发送
-                const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
-                const argsStr = JSON.stringify(toolCall.arguments);
-
-                // 发送 tool_call 开始块（name + 空的 arguments）
-                const toolStartChunk = {
+              if (!responseEnded && res.writable) {
+                const firstChunk = {
                   id: chunkId,
                   object: 'chat.completion.chunk',
                   created: Math.floor(Date.now() / 1000),
                   model: model,
                   choices: [{
                     index: 0,
-                    delta: {
-                      tool_calls: [{
-                        index: 0,
-                        id: toolCallId,
-                        type: 'function',
-                        function: {
-                          name: toolCall.name,
-                          arguments: ''
-                        }
-                      }]
-                    },
+                    delta: { role: 'assistant', content: null },
                     finish_reason: null
                   }]
                 };
-                res.write(`data: ${JSON.stringify(toolStartChunk)}\n\n`);
+                res.write(`data: ${JSON.stringify(firstChunk)}\n\n`);
+              }
 
-                // 逐步发送 arguments（可以按字符或分块发送）
+              if (hasTool) {
+                // 2. 工具调用流式发送
+                const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
+                const argsStr = JSON.stringify(toolCall.arguments);
+
+                // 发送 tool_call 开始块
+                if (!responseEnded && res.writable) {
+                  const toolStartChunk = {
+                    id: chunkId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: {
+                        tool_calls: [{
+                          index: 0,
+                          id: toolCallId,
+                          type: 'function',
+                          function: {
+                            name: toolCall.name,
+                            arguments: ''
+                          }
+                        }]
+                      },
+                      finish_reason: null
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(toolStartChunk)}\n\n`);
+                }
+
+                // 逐步发送 arguments
                 for (let i = 0; i < argsStr.length; i++) {
+                  if (responseEnded || !res.writable) {
+                    console.log('[HTTP] 流式发送 arguments 过程中检测到连接断开，提前终止');
+                    break;
+                  }
                   const argChunk = {
                     id: chunkId,
                     object: 'chat.completion.chunk',
@@ -871,59 +949,73 @@ async function main() {
                     }]
                   };
                   res.write(`data: ${JSON.stringify(argChunk)}\n\n`);
-                  await new Promise(r => setTimeout(r, 5)); // 模拟流式延迟
+                  await new Promise(r => setTimeout(r, 5));
                 }
 
-                // 最后发送 finish_reason
-                const finalChunk = {
-                  id: chunkId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [{
-                    index: 0,
-                    delta: {},
-                    finish_reason: 'tool_calls'
-                  }]
-                };
-                res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                // 发送 finish_reason 和 DONE
+                if (!responseEnded && res.writable) {
+                  const finalChunk = {
+                    id: chunkId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: {},
+                      finish_reason: 'tool_calls'
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                  res.write('data: [DONE]\n\n');
+                  res.end();
+                } else {
+                  console.log('[HTTP] 工具调用流式响应结束，但连接已不可写，跳过发送结束标记');
+                }
               } else {
-                // 3. 普通文本流式输出（保留你原来的逐字发送逻辑）
+                // 3. 普通文本流式输出
                 for (const char of rawOutput) {
-                    const chunk = {
-                        id: chunkId,
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: model,
-                        choices: [{
-                            index: 0,
-                            delta: { content: char },
-                            finish_reason: null
-                        }]
-                    };
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                    await new Promise(r => setTimeout(r, 20));
+                  if (responseEnded || !res.writable) {
+                    console.log('[HTTP] 普通文本流式发送过程中检测到连接断开，提前终止');
+                    break;
+                  }
+                  const chunk = {
+                    id: chunkId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: { content: char },
+                      finish_reason: null
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                  await new Promise(r => setTimeout(r, 20));
                 }
-                const finalChunk = {
-                  id: chunkId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [{
-                    index: 0,
-                    delta: {},
-                    finish_reason: 'stop'
-                  }]
-                };
-                res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-              }
 
-              res.write('data: [DONE]\n\n');
-              res.end();
+                if (!responseEnded && res.writable) {
+                  const finalChunk = {
+                    id: chunkId,
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model,
+                    choices: [{
+                      index: 0,
+                      delta: {},
+                      finish_reason: 'stop'
+                    }]
+                  };
+                  res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                  res.write('data: [DONE]\n\n');
+                  res.end();
+                } else {
+                  console.log('[HTTP] 普通文本流式响应结束，但连接已不可写，跳过发送结束标记');
+                }
+              }
               return;
             }
 
-            // ---- 非流式响应 ----
+                        // ---- 非流式响应 ----
             const response = {
               id: 'chatcmpl-' + Date.now(),
               object: 'chat.completion',
@@ -958,24 +1050,23 @@ async function main() {
               };
             }
 
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(response));
+            if (res.writable) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(response));
+            } else {
+              console.log('[HTTP] 非流式响应时连接已不可写，丢弃结果');
+            }
 
           } catch (e) {
-            // 如果是客户端主动断开导致的异常，静默丢弃，不发送任何响应
-            if (cancelState.cancelled) {
-              console.log('[HTTP] 客户端已断开连接，终止处理');
-              return;
-            }
             console.log('[HTTP] 处理请求异常:', e.message);
-            // 即使客户端断开，也尝试发送错误响应，避免挂起
+            // 尝试发送错误响应，无论客户端是否提前断开
             try {
-              if (res.writable) {
+              if (res.writable && !res.headersSent) {
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: { message: e.message, type: 'server_error' } }));
               }
             } catch (_) {
-              // 无法写入（客户端已断），忽略
+              console.log('[HTTP] 发送错误响应失败');
             }
           }
         };
