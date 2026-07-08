@@ -631,8 +631,22 @@ async function main() {
             // console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', body);
             const data = JSON.parse(body);
             const messages = data.messages || [];
+
+            // 辅助函数：安全地从 content 中提取文本（兼容字符串、数组、null）
+            function extractTextContent(content) {
+              if (typeof content === 'string') return content;
+              if (Array.isArray(content)) {
+                return content.map(part => {
+                  if (part.type === 'text') return part.text || '';
+                  return '[非文本内容]'; // 图片等类型使用占位符
+                }).join('');
+              }
+              if (content === null || content === undefined) return '';
+              return JSON.stringify(content); // 其他对象尝试序列化
+            }
+
             const userMsgs = messages.filter(m => m.role === 'user');
-            let userMsg = userMsgs.length ? userMsgs[userMsgs.length - 1].content : '';
+            let userMsg = userMsgs.length ? extractTextContent(userMsgs[userMsgs.length - 1].content) : '';
             const tools = data.tools || [];
             const toolNames = tools.map(t => t.function.name);
 
@@ -659,7 +673,8 @@ async function main() {
             const recentMessages = messages.slice(-MAX_HISTORY);
             let promptText = "";
             for (const msg of recentMessages) {
-              const content = (msg.content || '').slice(0, 2000); // 防止单条消息过长
+              const rawContent = extractTextContent(msg.content);
+              const content = rawContent.slice(0, 2000);
               if (msg.role === 'system') {
                 promptText += `【系统提示】\n${content}`;
               } else if (msg.role === 'user') {
