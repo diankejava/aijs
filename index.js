@@ -395,172 +395,79 @@ async function main() {
       return JSON.parse(safeText);
     }
 
-    // 解析模型输出中的工具调用
+    // 解析模型输出中的工具调用（新格式：<tool_call name="函数名">参数JSON</tool_call>）
     function parseToolCall(text, allowedNames = []) {
-      const startTag = '<tool_call>';
-      const endTag = '</tool_call>';
-
-      // 收集所有标签的处理结果，最终只使用最后一个
+      // 同时匹配 <tool_call name="...">...</tool_call> 和实体编码形式
+      const regex = /(?:<tool_call\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/tool_call>)|(?:&lt;tool_call\s+name\s*=\s*"([^"]*)"\s*&gt;([\s\S]*?)&lt;\/tool_call&gt;)/gi;
       const results = [];
-      let searchIndex = 0;
+      let match;
+      
+      // HTML 实体解码辅助函数
+      const decodeEntities = (str) => {
+        return str.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+                  .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+                  .replace(/&#39;/g, "'");
+      };
 
-      while ((searchIndex = text.indexOf(startTag, searchIndex)) !== -1) {
-          const tagStartIndex = searchIndex;
-          let pos = searchIndex + startTag.length;
+      while ((match = regex.exec(text)) !== null) {
+        // 捕获组1、2对应原标签，3、4对应实体标签
+        const rawName = (match[1] || match[3] || '').trim();
+        const rawArgs = (match[2] || match[4] || '').trim();
 
-          // 跳过标签后的空白
-          while (pos < text.length && /\s/.test(text[pos])) {
-              pos++;
-          }
+        if (!rawName) {
+          results.push({ success: false, error: 'name 属性不能为空' });
+          continue;
+        }
 
-          // 必须以 '{' 开始 JSON 对象
-          if (pos >= text.length || text[pos] !== '{') {
-              results.push({
-                  success: false,
-                  error: '<tool_call> 标签内必须直接包含 JSON 对象'
-              });
-              searchIndex = tagStartIndex + startTag.length;
-              continue;
-          }
-
-          // 扫描 JSON 对象，跟踪大括号深度和字符串状态
-          let depth = 0;
-          let inString = false;
-          let escape = false;        // 是否遇到反斜杠转义
-          const jsonStart = pos;
-          let jsonEnd = -1;          // 包含 '}' 的位置
-          let i = pos;
-
-          for (; i < text.length; i++) {
-              const ch = text[i];
-
-              if (escape) {
-                  // 转义状态：跳过当前字符（无论是什么），恢复
-                  escape = false;
-                  continue;
-              }
-
-              if (inString) {
-                  if (ch === '\\') {
-                      escape = true;
-                  } else if (ch === '"') {
-                      inString = false;   // 字符串结束
-                  }
-                  // 其他字符直接忽略（包括 <、/ 等）
-              } else {
-                  // 不在字符串内
-                  if (ch === '"') {
-                      inString = true;
-                  } else if (ch === '{') {
-                      depth++;
-                  } else if (ch === '}') {
-                      depth--;
-                      if (depth === 0) {
-                          // JSON 对象闭合，检查后面是否紧接 </tool_call>（允许空白）
-                          let endCheck = i + 1;
-                          while (endCheck < text.length && /\s/.test(text[endCheck])) {
-                              endCheck++;
-                          }
-                          if (text.startsWith(endTag, endCheck)) {
-                              jsonEnd = i;
-                              // 更新搜索起点，继续寻找下一个 <tool_call>
-                              searchIndex = endCheck + endTag.length;
-                          } else {
-                              // depth 为 0 但后面不是结束标签，格式错误
-                              searchIndex = tagStartIndex + startTag.length;
-                          }
-                          break; // 退出 for 循环
-                      }
-                  }
-                  // 其他字符忽略
-              }
-          }
-
-          // 检查是否成功提取 JSON
-          if (jsonEnd === -1) {
-              // 未找到匹配的闭合标签或对象未正确结束
-              results.push({
-                  success: false,
-                  error: '无法找到与 <tool_call> 匹配的 </tool_call>，或 JSON 对象未正确闭合'
-              });
-              if (searchIndex === tagStartIndex + startTag.length) {
-                  // 如果上面 break 时未更新 searchIndex（因 i 到了末尾），手动推进
-                  searchIndex = tagStartIndex + startTag.length;
-              }
-              continue;
-          }
-
-          const jsonStr = text.substring(jsonStart, jsonEnd + 1);
-
-          // 解析 JSON
-          let parsed;
+        let parsedArgs;
+        try {
+          // 解码后再解析 JSON
+          parsedArgs = JSON.parse(decodeEntities(rawArgs));
+        } catch (e) {
+          // 尝试自动修复常见错误：未转义的内部双引号和真实换行
+          let fixedArgs = rawArgs
+            .replace(/(?<!\\)"(?=[^"]*":\s*")/g, '\\"')  // 简单修复未转义的双引号（非健壮，仅示例）
+            .replace(/\n/g, '\\n');
           try {
-              parsed = JSON.parse(jsonStr);
-          } catch (e) {
-              results.push({
-                  success: false,
-                  error: `JSON 解析失败：${e.message}。出错的 JSON 片段：${jsonStr}`
-              });
-              continue;
+            parsedArgs = JSON.parse(fixedArgs);
+          } catch (e2) {
+            // 最终失败，报错
+            results.push({ success: false, error: `参数 JSON 解析失败：${e.message}` });
+            continue;
           }
+        }
 
-          // 字段校验
-          if (typeof parsed.name !== 'string' || parsed.name.length === 0) {
-              results.push({
-                  success: false,
-                  error: 'JSON 中缺少有效的 "name" 字段，请确保 "name" 存在且不为空'
-              });
-              continue;
-          }
-          if (typeof parsed.arguments !== 'object' || parsed.arguments === null) {
-              results.push({
-                  success: false,
-                  error: '"arguments" 必须是一个 JSON 对象'
-              });
-              continue;
-          }
-          if (allowedNames.length > 0 && !allowedNames.includes(parsed.name)) {
-              results.push({
-                  success: false,
-                  error: `无效的函数名 "${parsed.name}"，允许的函数名：${allowedNames.join(', ')}`
-              });
-              continue;
-          }
+        if (typeof parsedArgs !== 'object' || parsedArgs === null) {
+          results.push({ success: false, error: 'arguments 必须是一个 JSON 对象' });
+          continue;
+        }
 
-          // 所有检查通过，记录成功结果
+        if (allowedNames.length > 0 && !allowedNames.includes(rawName)) {
           results.push({
-              success: true,
-              toolCall: { name: parsed.name, arguments: parsed.arguments }
+            success: false,
+            error: `无效的函数名 "${rawName}"，允许的函数名：${allowedNames.join(', ')}`
           });
+          continue;
+        }
+
+        results.push({ success: true, toolCall: { name: rawName, arguments: parsedArgs } });
       }
 
-      // 没有找到任何 <tool_call> 标签
       if (results.length === 0) {
-          if (text.includes('tool_call')) {
-              return {
-                  found: true,
-                  success: false,
-                  error: '存在 <tool_call> 标签但无法解析，注意<tool_call>标签中没有任何属性'
-              };
-          }
-          return { found: false, success: false, toolCall: null };
+        if (/<tool_call|&lt;tool_call/i.test(text)) {
+          return {
+            found: true,
+            success: false,
+            error: '存在 <tool_call> 标签但无法解析，正确格式：<tool_call name="函数名">参数JSON</tool_call>'
+          };
+        }
+        return { found: false, success: false, toolCall: null };
       }
 
-      // 只取最后一个标签的结果
-      const lastResult = results[results.length - 1];
-      if (lastResult.success) {
-          return {
-              found: true,
-              success: true,
-              toolCall: lastResult.toolCall
-          };
-      } else {
-          return {
-              found: true,
-              success: false,
-              error: lastResult.error
-          };
-      }
+      const last = results[results.length - 1];
+      return last.success
+        ? { found: true, success: true, toolCall: last.toolCall }
+        : { found: true, success: false, error: last.error };
     }
 
     /**
@@ -606,7 +513,7 @@ async function main() {
       while (hasTools && !parseResult.found && noToolAttempt < maxNoToolRetries) {
         noToolAttempt++;
         console.log(`[ToolCall] 模型未输出工具调用，第 ${noToolAttempt}/${maxNoToolRetries} 次要求继续`);
-        const continuePrompt = `${rawOutput}\n\n【系统提示】如果任务尚未完成，请根据上述内容，立即输出下一步需要调用的工具，格式如下：\n<tool_call>\n{"name": "函数名", "arguments": {}}\n</tool_call>\n只输出工具调用，不要加其他文字。如果任务已完成，请输出“任务已完成”。`;
+        const continuePrompt = `${rawOutput}\n\n【系统提示】如果任务尚未完成，请根据上述内容，立即输出下一步需要调用的工具，格式如下（单行，无其他文字）：\n<tool_call name="函数名">参数JSON</tool_call>\n参数JSON必须合法且转义正确（双引号用\\"转义，换行用\\n转义）。只输出这一行，不要加其他文字。如果任务已完成，请输出“任务已完成”。`;
         reply = await sendAndWait(continuePrompt, cancelState);
         rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
         console.log('[HTTP] 继续后输出:', rawOutput);
@@ -642,16 +549,19 @@ async function main() {
           return { toolCall: parseResult.toolCall, rawOutput };
         }
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
-        const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用】\n` +
-          `上一轮你的工具调用 JSON 解析失败，错误信息：${parseResult.error}\n` +
-          `【你必须严格遵循以下格式，整个回复只能有一行，不能有其他内容】
-  - 立即输出正确格式的工具调用：
-    <tool_call>{"name": "函数名", "arguments": {合法JSON对象}}</tool_call>
-  - 要求：
-    1. <tool_call> 与 { 之间不能有空格或换行。
-    2. JSON 内所有字符串用双引号，内含的双引号用 \\\" 转义。
-    3. 参数中如需表示换行，请使用 \\n 转义，不要输入真实换行。
-    4. 不要输出任何解释、道歉或额外文字，只输出这一行。
+        const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用，必须严格按照要求】\n` +
+  `上一轮你的工具调用格式错误，具体错误：${parseResult.error}\n` +
+  `【请立即按以下规则输出正确的工具调用，整个回复只能有一行，不能有任何其他内容】
+  - 正确格式（单行，无额外文字）：
+    <tool_call name="函数名">单行合法JSON</tool_call>
+  - 关键要求（必须100%遵守）：
+    1. name 后紧跟双引号中的函数名。
+    2. JSON 字符串内所有的英文双引号必须写成 \\" 转义，例如："他说：\\"你好\\""。
+    3. 如果内容包含换行，必须使用 \\n 转义，绝对禁止输入真实换行符（按回车）。
+    4. JSON 不能有多余逗号，不能换行，不能缩进，必须紧凑在一行。
+    5. 不要输出任何解释、道歉、感叹词，只输出这一行调用。
+  - 再次强调正确示例：
+    <tool_call name="save_note">{"title": "笔记", "body": "第一行\\n第二行，引用\\"内容\\"结束"}</tool_call>
   如果任务已完成，请输出“任务已完成”。`;
 
         reply = await sendAndWait(retryPrompt, cancelState);
@@ -768,25 +678,34 @@ async function main() {
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
             const toolCallInstructions = tools.length > 0
-              ? `【关键工具调用规则 - 必须严格遵守】
+  ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
   - 当你需要调用工具时，整个回复只能包含一个 <tool_call> 块，不能有任何其他文字、解释或换行。
-  - <tool_call> 必须紧贴 JSON，中间不能有任何字符（包括换行）。
-  - JSON 对象必须合法：使用双引号，不能有多余逗号，所有字符串内的双引号必须用反斜杠转义（\\\"）。
-  - 若参数值包含换行，请使用 \\n 转义序列，绝对不要输入真实的换行符。
-  - 正确格式（单行，紧贴）：
-    <tool_call>{"name": "函数名", "arguments": {参数对象}}</tool_call>
+  - 格式：<tool_call name="函数名">参数JSON</tool_call>
+  - name 必须与可用函数名完全一致。
+  - 参数JSON对象必须合法、紧凑、单行，并严格遵守JSON转义规范：
+    1. 所有字符串用英文双引号包裹，内部的英文双引号必须用反斜杠转义，如 \\"text\\"。
+    2. 任何字符串值中如果含有换行，必须使用 \\n 转义，绝对、绝对不要输入真实的换行符。
+    3. 不能有多余逗号（如末尾逗号）。
+    4. 整个JSON必须在一行内，不允许换行，不允许缩进。
+  - 正确示例（注意双引号转义）：
+    <tool_call name="send_message">{"content": "他说：\\"你好，世界\\"\\n第二行内容"}</tool_call>
+  - 正确示例（多参数无特殊字符）：
+    <tool_call name="search">{"query": "今天天气", "limit": 5}</tool_call>
 
-  【错误示例（绝对禁止）】
-  1. 在 <tool_call> 和 JSON 之间换行或加空格：<tool_call> {"name":...}
-  2. 在 JSON 内部包含真实换行：{"content": "第一行\n第二行"}  ← 这是错误的（应写为 \\\\n）
-  3. 在 <tool_call> 之外附加文字：好的，我将调用工具...<tool_call>...
-  4. 使用中文引号或单引号
-
-  【正确示例（仅此一种）】
-  <tool_call>{"name": "search", "arguments": {"query": "今天天气如何"}}</tool_call>
+  【错误示例（绝对禁止，会导致解析失败）】
+  1. 未转义内部双引号：{"content": "他说："你好""}  ← 错误！
+  2. JSON内包含真实换行：
+     {
+       "text": "第一行
+        第二行"
+     }
+     ← 绝对错误，必须写成 "第一行\\n第二行"
+  3. 在标签外添加任何文字：好的，我来调用工具...<tool_call ...>
+  4. 使用旧格式：<tool_call>{"name":"xx","arguments":{}}</tool_call> （此格式已废弃）
+  5. JSON 末尾有多余逗号或标签内有多余空格
 
   如果不需要使用工具，直接输出文本回复。`
-              : '';
+  : '';
 
             const { toolCall, rawOutput } = await getFinalReplyWithTools(
               promptText, toolsText, toolCallInstructions,toolNames,cancelState
