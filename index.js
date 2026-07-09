@@ -403,66 +403,71 @@ async function main() {
 
     // 解析模型输出中的工具调用（新格式：<tool_call name="函数名">参数JSON</tool_call>）
     function parseToolCall(text, allowedNames = []) {
-      // 同时匹配 <tool_call name="...">...</tool_call> 和实体编码形式
-      const regex = /(?:<tool_call\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/tool_call>)|(?:&lt;tool_call\s+name\s*=\s*"([^"]*)"\s*&gt;([\s\S]*?)&lt;\/tool_call&gt;)/gi;
+      if (!text) return { found: false, success: false, toolCall: null };
+
       const results = [];
-      let match;
-      
-      // HTML 实体解码辅助函数
       const decodeEntities = (str) => {
         return str.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
                   .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
                   .replace(/&#39;/g, "'");
       };
 
-      while ((match = regex.exec(text)) !== null) {
-        // 捕获组1、2对应原标签，3、4对应实体标签
-        const rawName = (match[1] || match[3] || '').trim();
-        const rawArgs = (match[2] || match[4] || '').trim();
+      // 匹配 <tool_call name="..."> ... </tool_call> 或实体编码形式
+      const openTags = [
+        { prefix: '<tool_call name="', suffix: '">', close: '</tool_call>' },
+        { prefix: '&lt;tool_call name="', suffix: '"&gt;', close: '&lt;/tool_call&gt;' }
+      ];
 
-        if (!rawName) {
-          results.push({ success: false, error: 'name 属性不能为空' });
-          continue;
-        }
+      for (const tag of openTags) {
+        let searchFrom = 0;
+        while (true) {
+          const startIdx = text.indexOf(tag.prefix, searchFrom);
+          if (startIdx === -1) break;
 
-        let parsedArgs;
-        try {
-          // 解码后再解析 JSON
-          parsedArgs = JSON.parse(decodeEntities(rawArgs));
-        } catch (e) {
-          // 只自动修复真实换行，双引号问题靠重试提示解决
-          let fixedArgs = rawArgs.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-          try {
-            parsedArgs = JSON.parse(fixedArgs);
-          } catch (e2) {
-            results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
+          // 找到 name 结束引号的位置
+          const nameEnd = text.indexOf(tag.suffix, startIdx + tag.prefix.length);
+          if (nameEnd === -1) break;
+
+          const rawName = text.substring(startIdx + tag.prefix.length, nameEnd).trim();
+          if (!rawName) {
+            results.push({ success: false, error: 'name 属性不能为空' });
+            searchFrom = nameEnd + tag.suffix.length;
             continue;
           }
-        }
 
-        if (typeof parsedArgs !== 'object' || parsedArgs === null) {
-          results.push({ success: false, error: 'arguments 必须是一个 JSON 对象' });
-          continue;
-        }
+          // 找到闭合标签
+          const closeIdx = text.indexOf(tag.close, nameEnd + tag.suffix.length);
+          if (closeIdx === -1) break;
 
-        if (allowedNames.length > 0 && !allowedNames.includes(rawName)) {
-          results.push({
-            success: false,
-            error: `无效的函数名 "${rawName}"，允许的函数名：${allowedNames.join(', ')}`
-          });
-          continue;
-        }
+          const rawArgs = text.substring(nameEnd + tag.suffix.length, closeIdx).trim();
+          let parsedArgs;
+          try {
+            parsedArgs = JSON.parse(decodeEntities(rawArgs));
+          } catch (e) {
+            let fixedArgs = rawArgs.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+            try {
+              parsedArgs = JSON.parse(fixedArgs);
+            } catch (e2) {
+              results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
+              searchFrom = closeIdx + tag.close.length;
+              continue;
+            }
+          }
 
-        results.push({ success: true, toolCall: { name: rawName, arguments: parsedArgs } });
+          if (typeof parsedArgs !== 'object' || parsedArgs === null) {
+            results.push({ success: false, error: 'arguments 必须是一个 JSON 对象' });
+          } else if (allowedNames.length > 0 && !allowedNames.includes(rawName)) {
+            results.push({ success: false, error: `无效的函数名 "${rawName}"，允许的函数名：${allowedNames.join(', ')}` });
+          } else {
+            results.push({ success: true, toolCall: { name: rawName, arguments: parsedArgs } });
+          }
+          searchFrom = closeIdx + tag.close.length;
+        }
       }
 
       if (results.length === 0) {
-        if (/<tool_call|&lt;tool_call/i.test(text)) {
-          return {
-            found: true,
-            success: false,
-            error: '存在 <tool_call> 标签但无法解析，正确格式：<tool_call name="函数名">参数JSON</tool_call>'
-          };
+        if (text.includes('<tool_call') || text.includes('&lt;tool_call')) {
+          return { found: true, success: false, error: '存在 <tool_call> 标签但无法解析，正确格式：<tool_call name="函数名">参数JSON</tool_call>' };
         }
         return { found: false, success: false, toolCall: null };
       }
