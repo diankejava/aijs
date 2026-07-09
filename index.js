@@ -174,7 +174,7 @@ async function main() {
         });
 
         if (found) {
-          console.log('\x1b[35m[DEBUG] 最新 AI 回复已完成\x1b[0m');
+          console.log('\x1b[35m[DEBUG] 检测到完成信号，等待内容稳定...\x1b[0m');
           await page.waitForTimeout(300);
           let reply = await page.evaluate(() => {
               const items = document.querySelectorAll('[data-virtual-list-item-key]');
@@ -186,8 +186,10 @@ async function main() {
               const rawHTML = main.innerHTML;
               const toolCallMatch = rawHTML.match(/&lt;tool_call&gt;([\s\S]*?)&lt;\/tool_call&gt;/i);
               
-              // 直接使用 textContent 获取纯文本内容，避免 HTML 标签污染
-              let text = main.textContent.trim();
+              // 有工具调用时用 textContent，纯文本回复时用 innerText 保留换行
+              let text = toolCallMatch
+                ? main.textContent.trim()
+                : main.innerText.trim();
 
               text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
               if (text.includes('User:') || text.includes('Assistant:')) return '';
@@ -201,7 +203,11 @@ async function main() {
               const last = items[items.length - 1];
               const main = last.querySelector('.ds-assistant-message-main-content');
               if (!main) return '';
-              let text = main.textContent.trim();
+              const rawHTML2 = main.innerHTML;
+              const hasToolCall2 = /<tool_call/i.test(rawHTML2);
+              let text = hasToolCall2
+                ? main.textContent.trim()
+                : main.innerText.trim();
               text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
               if (text.includes('User:') || text.includes('Assistant:')) return '';
               return text;
