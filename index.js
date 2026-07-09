@@ -424,15 +424,12 @@ async function main() {
           // 解码后再解析 JSON
           parsedArgs = JSON.parse(decodeEntities(rawArgs));
         } catch (e) {
-          // 尝试自动修复常见错误：未转义的内部双引号和真实换行
-          let fixedArgs = rawArgs
-            .replace(/(?<!\\)"(?=[^"]*":\s*")/g, '\\"')  // 简单修复未转义的双引号（非健壮，仅示例）
-            .replace(/\n/g, '\\n');
+          // 只自动修复真实换行，双引号问题靠重试提示解决
+          let fixedArgs = rawArgs.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
           try {
             parsedArgs = JSON.parse(fixedArgs);
           } catch (e2) {
-            // 最终失败，报错
-            results.push({ success: false, error: `参数 JSON 解析失败：${e.message}` });
+            results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
             continue;
           }
         }
@@ -570,7 +567,7 @@ async function main() {
         } else {
           console.log('[ToolCall] 纠正请求未获得有效回复，保留上一轮输出');
         }
-        console.log('[HTTP] 纠正后输出:', rawOutput.slice(0, 150));
+        console.log('[HTTP] 纠正后输出:', rawOutput);
 
         // 格式纠正过程中也可能输出“任务已完成”
         if (rawOutput.includes('任务已完成')) {
@@ -657,17 +654,17 @@ async function main() {
             }
             
             // 防重放过滤器（保留）
-            if (userMsg.includes('User:') || userMsg.includes('Assistant:')) {
-              console.log('\x1b[31m[网关拦截] 检测到回流的对话历史，已拒绝:\x1b[0m', userMsg.slice(0, 80));
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({
-                choices: [{
-                  message: { role: 'assistant', content: '请求已被拦截，请勿发送包含对话历史的脏数据。' },
-                  finish_reason: 'stop'
-                }]
-              }));
-              return;
-            }
+            // if (userMsg.includes('User:') || userMsg.includes('Assistant:')) {
+            //   console.log('\x1b[31m[网关拦截] 检测到回流的对话历史，已拒绝:\x1b[0m', userMsg.slice(0, 80));
+            //   res.writeHead(200, { 'Content-Type': 'application/json' });
+            //   res.end(JSON.stringify({
+            //     choices: [{
+            //       message: { role: 'assistant', content: '请求已被拦截，请勿发送包含对话历史的脏数据。' },
+            //       finish_reason: 'stop'
+            //     }]
+            //   }));
+            //   return;
+            // }
 
             const MAX_HISTORY = 20;
             const recentMessages = messages.slice(-MAX_HISTORY);
