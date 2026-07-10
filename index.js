@@ -557,13 +557,23 @@ async function main() {
           return { toolCall: parseResult.toolCall, rawOutput };
         }
         console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
+                // 从错误信息中提取出错的 JSON 片段，构造修正示例
+        let errorDetail = parseResult.error;
+        let fixExample = '';
+        const failedJsonMatch = errorDetail.match(/失败的JSON:\s*(.*)/);
+        if (failedJsonMatch) {
+          const failedJson = failedJsonMatch[1].trim();
+          // 将反斜杠替换为双反斜杠，并确保单行
+          const fixedJson = failedJson.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+          fixExample = `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}\n  【修正后应写为】：${fixedJson.slice(0, 200)}`;
+        }
         const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用，必须严格按照要求】\n` +
-  `上一轮你的工具调用格式错误，具体错误：${parseResult.error}\n` +
+  `上一轮你的工具调用格式错误，具体错误：${parseResult.error}${fixExample}\n` +
   `【请立即按以下规则输出正确的工具调用，整个回复只能有一行，不能有任何其他内容】
   - 正确格式（单行，无额外文字）：
     <tool_call name="函数名">单行合法JSON</tool_call>
   - 关键要求（必须100%遵守）：
-    1. name 后紧跟双引号中的函数名。
+    1. 路径中的反斜杠必须写成 \\\\，例如 "E:\\\\geo-boot\\\\..."，绝对不能只写单个 \\。
     2. JSON 字符串内所有的英文双引号必须写成 \\" 转义，例如："他说：\\"你好\\""。
     3. 如果内容包含换行，必须使用 \\n 转义，绝对禁止输入真实换行符（按回车）。
     4. JSON 不能有多余逗号，不能换行，不能缩进，必须紧凑在一行。
@@ -601,14 +611,25 @@ async function main() {
           }
           // 最终回退时同样清洗
           const cleaned = cleanTaskCompletedMark(firstOutput);
-          return { toolCall: null, rawOutput: cleaned || firstOutput };
+          const text = cleaned || firstOutput;
+          // 防止将含有未解析工具调用标签的文本返回给客户端
+          if (/<tool_call|&lt;tool_call/i.test(text)) {
+            console.log('[ToolCall] 纠正循环回退时检测到残余标签，返回错误提示');
+            return { toolCall: null, rawOutput: '【系统提示】工具调用格式错误，请简化指令后重试。' };
+          }
+          return { toolCall: null, rawOutput: text };
         }
       }
 
       console.log('[ToolCall] 重试次数用尽，降级为纯文本回复');
       // 最终降级时也清洗
       const cleaned = cleanTaskCompletedMark(firstOutput);
-      return { toolCall: null, rawOutput: cleaned || firstOutput };
+      const text = cleaned || firstOutput;
+      if (/<tool_call|&lt;tool_call/i.test(text)) {
+        console.log('[ToolCall] 最终降级时检测到残余标签，返回错误提示');
+        return { toolCall: null, rawOutput: '【系统提示】多次纠正工具格式失败，请简化指令后重试。' };
+      }
+      return { toolCall: null, rawOutput: text };
     }
 
     // 原有的请求处理部分（仅展示核心修改）
@@ -717,16 +738,17 @@ async function main() {
 
   【错误示例（绝对禁止，会导致解析失败）】
   1. 未转义内部双引号：{"content": "他说："你好""}  ← 错误！
-  2. JSON内包含真实换行：
+  2. 如果字符串值中包含反斜杠（例如 Windows 路径），必须写成 \\\\ 转义，
+   例如：{"filePath": "E:\\\\abc\\\\..."}
+  3. JSON内包含真实换行：
      {
        "text": "第一行
         第二行"
      }
      ← 绝对错误，必须写成 "第一行\\n第二行"
-  3. 在标签外添加任何文字：好的，我来调用工具...<tool_call ...>
-  4. 使用旧格式：<tool_call>{"name":"xx","arguments":{}}</tool_call> （此格式已废弃）
-  5. JSON 末尾有多余逗号或标签内有多余空格
-
+  4. 在标签外添加任何文字：好的，我来调用工具...<tool_call ...>
+  5. 使用旧格式：<tool_call>{"name":"xx","arguments":{}}</tool_call> （此格式已废弃）
+  6. JSON 末尾有多余逗号或标签内有多余空格
   如果不需要使用工具，直接输出文本回复。`
   : '';
 
