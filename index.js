@@ -550,26 +550,24 @@ async function main() {
         return { toolCall: null, rawOutput: cleaned || rawOutput };
       }
 
-      // 格式错误则进入纠正循环（最多50次）
-      const maxRetries = 50;
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      // 无限纠正循环，直到模型输出正确的工具调用或任务完成
+      while (true) {
         if (parseResult.success) {
           return { toolCall: parseResult.toolCall, rawOutput };
         }
-        console.log(`[ToolCall] 格式错误，第 ${attempt}/${maxRetries} 次纠正重试`);
-                // 从错误信息中提取出错的 JSON 片段，构造修正示例
+        console.log('[ToolCall] 格式错误，继续纠正...');
+        // 从错误信息中提取出错的 JSON 片段，构造修正示例
         let errorDetail = parseResult.error;
         let fixExample = '';
         const failedJsonMatch = errorDetail.match(/失败的JSON:\s*(.*)/);
         if (failedJsonMatch) {
           const failedJson = failedJsonMatch[1].trim();
-          // 将反斜杠替换为双反斜杠，并确保单行
           const fixedJson = failedJson.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
           fixExample = `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}\n  【修正后应写为】：${fixedJson.slice(0, 200)}`;
         }
         const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用，必须严格按照要求】\n` +
-  `上一轮你的工具调用格式错误，具体错误：${parseResult.error}${fixExample}\n` +
-  `【请立即按以下规则输出正确的工具调用，整个回复只能有一行，不能有任何其他内容】
+          `上一轮你的工具调用格式错误，具体错误：${parseResult.error}${fixExample}\n` +
+          `【请立即按以下规则输出正确的工具调用，整个回复只能有一行，不能有任何其他内容】
   - 正确格式（单行，无额外文字）：
     <tool_call name="函数名">单行合法JSON</tool_call>
   - 关键要求（必须100%遵守）：
@@ -604,32 +602,12 @@ async function main() {
         }
 
         parseResult = parseToolCall(rawOutput, toolNames);
+        // 如果模型不再输出工具调用，结束循环，返回纯文本
         if (!parseResult.found) {
-          const firstParse = parseToolCall(firstOutput, toolNames);
-          if (firstParse.success) {
-            return { toolCall: firstParse.toolCall, rawOutput: firstOutput };
-          }
-          // 最终回退时同样清洗
-          const cleaned = cleanTaskCompletedMark(firstOutput);
-          const text = cleaned || firstOutput;
-          // 防止将含有未解析工具调用标签的文本返回给客户端
-          if (/<tool_call|&lt;tool_call/i.test(text)) {
-            console.log('[ToolCall] 纠正循环回退时检测到残余标签，返回错误提示');
-            return { toolCall: null, rawOutput: '【系统提示】工具调用格式错误，请简化指令后重试。' };
-          }
-          return { toolCall: null, rawOutput: text };
+          console.log('[ToolCall] 模型在纠正过程中停止输出工具调用，结束流程');
+          return { toolCall: null, rawOutput: rawOutput };
         }
       }
-
-      console.log('[ToolCall] 重试次数用尽，降级为纯文本回复');
-      // 最终降级时也清洗
-      const cleaned = cleanTaskCompletedMark(firstOutput);
-      const text = cleaned || firstOutput;
-      if (/<tool_call|&lt;tool_call/i.test(text)) {
-        console.log('[ToolCall] 最终降级时检测到残余标签，返回错误提示');
-        return { toolCall: null, rawOutput: '【系统提示】多次纠正工具格式失败，请简化指令后重试。' };
-      }
-      return { toolCall: null, rawOutput: text };
     }
 
     // 原有的请求处理部分（仅展示核心修改）
