@@ -192,6 +192,8 @@ async function main() {
                 : main.innerText.trim();
 
               text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
+              // 清洗页面 UI 杂讯（常见按钮文字、语言标签等）
+              text = text.replace(/^(复制|下载|运行|调试|代码|powershell|bash|python|javascript|typescript|css|html|json|yaml|xml|markdown|shell|cmd|sh|java|cpp|csharp|go|rust|ruby|php|sql|swift|kotlin|scala|r|perl|lua|dart|plaintext|text|diff|patch|ini|toml|env|nginx|apache|makefile|dockerfile|yml)$/gmi, '');
               if (text.includes('User:') || text.includes('Assistant:')) return '';
               return text;
           });
@@ -209,6 +211,7 @@ async function main() {
                 ? main.textContent.trim()
                 : main.innerText.trim();
               text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
+              text = text.replace(/^(复制|下载|运行|调试|代码|powershell|bash|python|javascript|typescript|css|html|json|yaml|xml|markdown|shell|cmd|sh|java|cpp|csharp|go|rust|ruby|php|sql|swift|kotlin|scala|r|perl|lua|dart|plaintext|text|diff|patch|ini|toml|env|nginx|apache|makefile|dockerfile|yml)$/gmi, '');
               if (text.includes('User:') || text.includes('Assistant:')) return '';
               return text;
             });
