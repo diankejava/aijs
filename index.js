@@ -515,39 +515,10 @@ async function main() {
 
       let parseResult = parseToolCall(rawOutput, toolNames);
 
-      // 如果请求包含工具，但模型没有输出工具调用，则追加提示并重试（最多3次）
-      const maxNoToolRetries = 3;
-      let noToolAttempt = 0;
-      while (hasTools && !parseResult.found && noToolAttempt < maxNoToolRetries) {
-        noToolAttempt++;
-        console.log(`[ToolCall] 模型未输出工具调用，第 ${noToolAttempt}/${maxNoToolRetries} 次要求继续`);
-        const continuePrompt = `${rawOutput}\n\n【系统提示】如果任务尚未完成，请根据上述内容，立即输出下一步需要调用的工具，格式如下（单行，无其他文字）：\n<tool_call name="函数名">参数JSON</tool_call>\n参数JSON必须合法且转义正确（双引号用\\"转义，换行用\\n转义）。只输出这一行，不要加其他文字。如果任务已完成，请输出“任务已完成”。`;
-        reply = await sendAndWait(continuePrompt, cancelState);
-        rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
-        console.log('[HTTP] 继续后输出:', rawOutput);
-
-        // 检查是否输出了“任务已完成”
-        if (rawOutput.includes('任务已完成')) {
-          const cleaned = cleanTaskCompletedMark(rawOutput);
-          if (cleaned) {
-            console.log('[ToolCall] 模型返回任务已完成标记，清洗后保留有效内容');
-            return { toolCall: null, rawOutput: cleaned };
-          } else {
-            // 清洗后为空，回退到 firstOutput，但也要确保 firstOutput 不包含标记
-            const fallback = cleanTaskCompletedMark(firstOutput) || '';
-            console.log('[ToolCall] 模型仅返回“任务已完成”，回退到首次正常输出');
-            return { toolCall: null, rawOutput: fallback };
-          }
-        }
-
-        parseResult = parseToolCall(rawOutput, toolNames);
-      }
-
-      // 此时若仍无工具调用，说明模型确实不想用工具，返回纯文本（finish_reason: stop）
+      // 如果还没有工具调用，我们会在下面的无限循环中持续要求模型输出
+      // 不再直接返回纯文本，避免客户端误判任务完成
       if (!parseResult.found) {
-        // 最终返回前也做一次清洗，防止残留标记
-        const cleaned = cleanTaskCompletedMark(rawOutput);
-        return { toolCall: null, rawOutput: cleaned || rawOutput };
+        parseResult = { found: false, success: false, error: '请输出正确的工具调用，不要只回复文本描述' };
       }
 
       // 无限纠正循环，直到模型输出正确的工具调用或任务完成
@@ -602,10 +573,10 @@ async function main() {
         }
 
         parseResult = parseToolCall(rawOutput, toolNames);
-        // 如果模型不再输出工具调用，结束循环，返回纯文本
+        // 如果模型依然没有输出工具调用，设置一个明确的错误，继续下一轮纠正
         if (!parseResult.found) {
-          console.log('[ToolCall] 模型在纠正过程中停止输出工具调用，结束流程');
-          return { toolCall: null, rawOutput: rawOutput };
+          console.log('[ToolCall] 模型仍未输出工具调用，继续要求...');
+          parseResult = { found: false, success: false, error: '仍未看到工具调用，必须输出 <tool_call name="...">...</tool_call>' };
         }
       }
     }
