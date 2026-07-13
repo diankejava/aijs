@@ -406,7 +406,7 @@ async function main() {
 
     // 解析模型输出中的工具调用（新格式：<tool_call name="函数名">参数JSON</tool_call>）
     function parseToolCall(text, allowedNames = []) {
-      if (!text) return { found: false, success: false, toolCall: null };
+      if (!text) return { found: false, success: false, toolCalls: [], toolCall: null };
 
       const results = [];
       const decodeEntities = (str) => {
@@ -415,7 +415,6 @@ async function main() {
                   .replace(/&#39;/g, "'");
       };
 
-      // 匹配 <tool_call name="..."> ... </tool_call> 或实体编码形式
       const openTags = [
         { prefix: '<tool_call name="', suffix: '">', close: '</tool_call>' },
         { prefix: '&lt;tool_call name="', suffix: '"&gt;', close: '&lt;/tool_call&gt;' }
@@ -427,7 +426,6 @@ async function main() {
           const startIdx = text.indexOf(tag.prefix, searchFrom);
           if (startIdx === -1) break;
 
-          // 找到 name 结束引号的位置
           const nameEnd = text.indexOf(tag.suffix, startIdx + tag.prefix.length);
           if (nameEnd === -1) break;
 
@@ -438,7 +436,6 @@ async function main() {
             continue;
           }
 
-          // 找到闭合标签
           const closeIdx = text.indexOf(tag.close, nameEnd + tag.suffix.length);
           if (closeIdx === -1) break;
 
@@ -451,9 +448,7 @@ async function main() {
             try {
               parsedArgs = JSON.parse(fixedArgs);
             } catch (e2) {
-              // 尝试修复 Windows 路径未转义的反斜杠
               if (e2.message.includes('Invalid escape') || e2.message.includes('Unexpected token')) {
-                // 只替换后面不是合法 JSON 转义字符的反斜杠
                 const unsafeBackslash = /(?<!\\)\\(?!["\\/bfnrtu])/g;
                 fixedArgs = fixedArgs.replace(unsafeBackslash, '\\\\');
                 try {
@@ -483,16 +478,26 @@ async function main() {
       }
 
       if (results.length === 0) {
-        if (text.includes('<tool_call') || text.includes('&lt;tool_call')) {
-          return { found: true, success: false, error: '存在 <tool_call> 标签但无法解析，正确格式：<tool_call name="函数名">参数JSON</tool_call>' };
+        if (/<(tool_calls|invoke|parameter|function_call|tool_use)/i.test(text)) {
+          return { found: true, success: false, toolCalls: [], toolCall: null, error: '检测到禁止的标签格式（如 <tool_calls>, <invoke>, <parameter>），必须使用 <tool_call name="函数名">参数JSON</tool_call>' };
         }
-        return { found: false, success: false, toolCall: null };
+        if (text.includes('<tool_call') || text.includes('&lt;tool_call')) {
+          return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <tool_call> 标签但无法解析，正确格式：<tool_call name="函数名">参数JSON</tool_call>' };
+        }
+        return { found: false, success: false, toolCalls: [], toolCall: null };
       }
 
-      const last = results[results.length - 1];
-      return last.success
-        ? { found: true, success: true, toolCall: last.toolCall }
-        : { found: true, success: false, error: last.error };
+      // 收集所有成功的工具调用
+      const successful = results.filter(r => r.success).map(r => r.toolCall);
+      const allSuccess = results.every(r => r.success);
+
+      return {
+        found: true,
+        success: allSuccess,
+        toolCalls: successful,
+        toolCall: successful.length > 0 ? successful[0] : null,
+        error: allSuccess ? null : results.find(r => !r.success)?.error || '部分工具调用解析失败'
+      };
     }
 
     /**
@@ -537,10 +542,10 @@ async function main() {
         // 已发现工具调用标签，进行无限纠正直到解析成功或任务完成
         while (true) {
           if (parseResult.success) {
-            return { toolCall: parseResult.toolCall, rawOutput };
+            return { toolCall: parseResult.toolCall, toolCalls: parseResult.toolCalls, rawOutput };
           }
           console.log('[ToolCall] 格式错误，继续纠正...');
-          // 构造修正示例
+          // 构造修正示例（取第一个失败的）
           let errorDetail = parseResult.error;
           let fixExample = '';
           const failedJsonMatch = errorDetail.match(/失败的JSON:\s*(.*)/);
@@ -555,6 +560,7 @@ async function main() {
   - 正确格式（单行，无额外文字）：
     <tool_call name="函数名">单行合法JSON</tool_call>
   - 关键要求（必须100%遵守）：
+    0. 严禁使用 <tool_calls>、<invoke>、<parameter> 等任何其他标签，只允许 <tool_call name="函数名">JSON</tool_call>。
     1. 路径中的反斜杠必须写成 \\\\，例如 "E:\\\\geo-boot\\\\..."，绝对不能只写单个 \\。
     2. JSON 字符串内所有的英文双引号必须写成 \\" 转义，例如："他说：\\"你好\\""。
     3. 如果内容包含换行，必须使用 \\n 转义，绝对禁止输入真实换行符（按回车）。
@@ -572,26 +578,23 @@ async function main() {
           }
           console.log('[HTTP] 纠正后输出:', rawOutput);
 
-          // 格式纠正过程中也可能输出“任务已完成”
           if (rawOutput.includes('任务已完成')) {
             const cleaned = cleanTaskCompletedMark(rawOutput);
             if (cleaned) {
               console.log('[ToolCall] 格式纠正时返回任务完成标记，清洗后返回');
-              return { toolCall: null, rawOutput: cleaned };
+              return { toolCall: null, toolCalls: [], rawOutput: cleaned };
             } else {
               const fallback = cleanTaskCompletedMark(firstOutput) || '';
               console.log('[ToolCall] 格式纠正时仅返回“任务已完成”，回退到首次正常输出');
-              return { toolCall: null, rawOutput: fallback };
+              return { toolCall: null, toolCalls: [], rawOutput: fallback };
             }
           }
 
           parseResult = parseToolCall(rawOutput, toolNames);
-          // 如果模型不再输出工具调用，则结束循环，返回纯文本
           if (!parseResult.found) {
             console.log('[ToolCall] 模型在纠正过程中停止输出工具调用，结束流程');
-            // 确保返回的文本中不包含残留的工具调用标签
             const cleanedOutput = rawOutput.replace(/<tool_call[^>]*>[\s\S]*?<\/tool_call>/gi, '');
-            return { toolCall: null, rawOutput: cleanedOutput.trim() || rawOutput };
+            return { toolCall: null, toolCalls: [], rawOutput: cleanedOutput.trim() || rawOutput };
           }
         }
       } else {
@@ -690,9 +693,9 @@ async function main() {
             const toolsText = tools.length > 0
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
-            const toolCallInstructions = tools.length > 0
+                        const toolCallInstructions = tools.length > 0
   ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
-  - 当你需要调用工具时，整个回复只能包含一个 <tool_call> 块，不能有任何其他文字、解释或换行。
+  - 当你需要调用工具时，可以输出一个或多个 <tool_call> 块，每个块一行，不能有其他文字。
   - 格式：<tool_call name="函数名">参数JSON</tool_call>
   - name 必须与可用函数名完全一致。
   - 参数JSON对象必须合法、紧凑、单行，并严格遵守JSON转义规范：
@@ -700,32 +703,29 @@ async function main() {
     2. 任何字符串值中如果含有换行，必须使用 \\n 转义，绝对、绝对不要输入真实的换行符。
     3. 不能有多余逗号（如末尾逗号）。
     4. 整个JSON必须在一行内，不允许换行，不允许缩进。
+    5. 如果字符串值中包含反斜杠（例如 Windows 路径），必须写成 \\\\，例如 "E:\\\\abc\\\\..."。
   - 正确示例（注意双引号转义）：
     <tool_call name="send_message">{"content": "他说：\\"你好，世界\\"\\n第二行内容"}</tool_call>
   - 正确示例（多参数无特殊字符）：
     <tool_call name="search">{"query": "今天天气", "limit": 5}</tool_call>
+  - 多工具正确示例：
+    <tool_call name="glob">{"path": "E:\\\\project", "pattern": "**/*.java"}</tool_call>
+    <tool_call name="read">{"filePath": "E:\\\\project\\\\Main.java", "offset": 1, "limit": 50}</tool_call>
+  【绝对禁止的格式（会导致严重错误）】
+  1. 禁止使用 <tool_calls>、<invoke>、<parameter>、<function_call> 等任何其他标签，只能使用 <tool_call>。
+  2. 禁止在标签内使用 XML 属性（如 string="true"），参数必须全部写在 JSON 对象中。
+  3. JSON 内部禁止出现真实换行。
+  4. 标签外禁止附加任何解释、道歉或描述。
+  5. 禁止使用旧格式 <tool_call>{"name":"xx","arguments":{}}</tool_call>。
 
-  【错误示例（绝对禁止，会导致解析失败）】
-  1. 未转义内部双引号：{"content": "他说："你好""}  ← 错误！
-  2. 如果字符串值中包含反斜杠（例如 Windows 路径），必须写成 \\\\ 转义，
-   例如：{"filePath": "E:\\\\abc\\\\..."}
-  3. JSON内包含真实换行：
-     {
-       "text": "第一行
-        第二行"
-     }
-     ← 绝对错误，必须写成 "第一行\\n第二行"
-  4. 在标签外添加任何文字：好的，我来调用工具...<tool_call ...>
-  5. 使用旧格式：<tool_call>{"name":"xx","arguments":{}}</tool_call> （此格式已废弃）
-  6. JSON 末尾有多余逗号或标签内有多余空格
   如果不需要使用工具，直接输出文本回复。`
   : '';
 
-            const { toolCall, rawOutput } = await getFinalReplyWithTools(
+            const { toolCall, toolCalls, rawOutput } = await getFinalReplyWithTools(
               promptText, toolsText, toolCallInstructions,toolNames,cancelState
             );
 
-            const hasTool = !!toolCall;
+            const hasTool = toolCalls && toolCalls.length > 0;
             const finishReason = hasTool ? 'tool_calls' : 'stop';
 
             // 检查工具参数大小，防止超大响应导致 RangeError（包括序列化自身失败）
@@ -827,62 +827,67 @@ async function main() {
               }
 
               if (hasTool) {
-                // 2. 工具调用流式发送
-                const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
-                const argsStr = JSON.stringify(toolCall.arguments);
+                // 2. 工具调用流式发送（支持多个）
+                for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
+                  const tc = toolCalls[tcIdx];
+                  const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
+                  const argsStr = JSON.stringify(tc.arguments);
 
-                // 发送 tool_call 开始块
-                if (!responseEnded && res.writable) {
-                  const toolStartChunk = {
-                    id: chunkId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: {
-                        tool_calls: [{
-                          index: 0,
-                          id: toolCallId,
-                          type: 'function',
-                          function: {
-                            name: toolCall.name,
-                            arguments: ''
-                          }
-                        }]
-                      },
-                      finish_reason: null
-                    }]
-                  };
-                  res.write(`data: ${JSON.stringify(toolStartChunk)}\n\n`);
-                }
-
-                // 逐步发送 arguments
-                for (let i = 0; i < argsStr.length; i++) {
-                  if (responseEnded || !res.writable) {
-                    console.log('[HTTP] 流式发送 arguments 过程中检测到连接断开，提前终止');
-                    break;
+                  // 发送 tool_call 开始块
+                  if (!responseEnded && res.writable) {
+                    const toolStartChunk = {
+                      id: chunkId,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: model,
+                      choices: [{
+                        index: 0,
+                        delta: {
+                          tool_calls: [{
+                            index: tcIdx,
+                            id: toolCallId,
+                            type: 'function',
+                            function: {
+                              name: tc.name,
+                              arguments: ''
+                            }
+                          }]
+                        },
+                        finish_reason: null
+                      }]
+                    };
+                    res.write(`data: ${JSON.stringify(toolStartChunk)}\n\n`);
                   }
-                  const argChunk = {
-                    id: chunkId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: {
-                        tool_calls: [{
-                          index: 0,
-                          function: {
-                            arguments: argsStr[i]
-                          }
-                        }]
-                      },
-                      finish_reason: null
-                    }]
-                  };
-                  res.write(`data: ${JSON.stringify(argChunk)}\n\n`);
-                  await new Promise(r => setTimeout(r, 5));
+
+                  // 逐步发送 arguments
+                  for (let i = 0; i < argsStr.length; i++) {
+                    if (responseEnded || !res.writable) {
+                      console.log('[HTTP] 流式发送 arguments 过程中检测到连接断开，提前终止');
+                      break;
+                    }
+                    const argChunk = {
+                      id: chunkId,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: model,
+                      choices: [{
+                        index: 0,
+                        delta: {
+                          tool_calls: [{
+                            index: tcIdx,
+                            function: {
+                              arguments: argsStr[i]
+                            }
+                          }]
+                        },
+                        finish_reason: null
+                      }]
+                    };
+                    res.write(`data: ${JSON.stringify(argChunk)}\n\n`);
+                    await new Promise(r => setTimeout(r, 5));
+                  }
+
+                  if (responseEnded || !res.writable) break;
                 }
 
                 // 发送 finish_reason 和 DONE
@@ -963,18 +968,17 @@ async function main() {
             };
 
             if (hasTool) {
-              const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
               response.choices[0].message = {
                 role: 'assistant',
                 content: null,
-                tool_calls: [{
-                  id: toolCallId,
+                tool_calls: toolCalls.map(tc => ({
+                  id: 'call_' + Math.random().toString(36).substr(2, 9),
                   type: 'function',
                   function: {
-                    name: toolCall.name,
-                    arguments: JSON.stringify(toolCall.arguments)
+                    name: tc.name,
+                    arguments: JSON.stringify(tc.arguments)
                   }
-                }]
+                }))
               };
             } else {
               response.choices[0].message = {
