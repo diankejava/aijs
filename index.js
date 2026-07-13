@@ -451,9 +451,23 @@ async function main() {
             try {
               parsedArgs = JSON.parse(fixedArgs);
             } catch (e2) {
-              results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
-              searchFrom = closeIdx + tag.close.length;
-              continue;
+              // 尝试修复 Windows 路径未转义的反斜杠
+              if (e2.message.includes('Invalid escape') || e2.message.includes('Unexpected token')) {
+                // 只替换后面不是合法 JSON 转义字符的反斜杠
+                const unsafeBackslash = /(?<!\\)\\(?!["\\/bfnrtu])/g;
+                fixedArgs = fixedArgs.replace(unsafeBackslash, '\\\\');
+                try {
+                  parsedArgs = JSON.parse(fixedArgs);
+                } catch (e3) {
+                  results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
+                  searchFrom = closeIdx + tag.close.length;
+                  continue;
+                }
+              } else {
+                results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
+                searchFrom = closeIdx + tag.close.length;
+                continue;
+              }
             }
           }
 
@@ -518,30 +532,26 @@ async function main() {
 
       let parseResult = parseToolCall(rawOutput, toolNames);
 
-      // 如果还没有工具调用，我们会在下面的无限循环中持续要求模型输出
-      // 不再直接返回纯文本，避免客户端误判任务完成
-      if (!parseResult.found) {
-        parseResult = { found: false, success: false, error: '请输出正确的工具调用，不要只回复文本描述' };
-      }
-
-      // 无限纠正循环，直到模型输出正确的工具调用或任务完成
-      while (true) {
-        if (parseResult.success) {
-          return { toolCall: parseResult.toolCall, rawOutput };
-        }
-        console.log('[ToolCall] 格式错误，继续纠正...');
-        // 从错误信息中提取出错的 JSON 片段，构造修正示例
-        let errorDetail = parseResult.error;
-        let fixExample = '';
-        const failedJsonMatch = errorDetail.match(/失败的JSON:\s*(.*)/);
-        if (failedJsonMatch) {
-          const failedJson = failedJsonMatch[1].trim();
-          const fixedJson = failedJson.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
-          fixExample = `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}\n  【修正后应写为】：${fixedJson.slice(0, 200)}`;
-        }
-        const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用，必须严格按照要求】\n` +
-          `上一轮你的工具调用格式错误，具体错误：${parseResult.error}${fixExample}\n` +
-          `【请立即按以下规则输出正确的工具调用，整个回复只能有一行，不能有任何其他内容】
+      // 无论是否声明了工具，只要回复中包含了工具调用标签，就尝试解析或纠正
+      if (parseResult.found) {
+        // 已发现工具调用标签，进行无限纠正直到解析成功或任务完成
+        while (true) {
+          if (parseResult.success) {
+            return { toolCall: parseResult.toolCall, rawOutput };
+          }
+          console.log('[ToolCall] 格式错误，继续纠正...');
+          // 构造修正示例
+          let errorDetail = parseResult.error;
+          let fixExample = '';
+          const failedJsonMatch = errorDetail.match(/失败的JSON:\s*(.*)/);
+          if (failedJsonMatch) {
+            const failedJson = failedJsonMatch[1].trim();
+            const fixedJson = failedJson.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+            fixExample = `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}\n  【修正后应写为】：${fixedJson.slice(0, 200)}`;
+          }
+          const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用，必须严格按照要求】\n` +
+            `上一轮你的工具调用格式错误，具体错误：${parseResult.error}${fixExample}\n` +
+            `【请立即按以下规则输出正确的工具调用，整个回复只能有一行，不能有任何其他内容】
   - 正确格式（单行，无额外文字）：
     <tool_call name="函数名">单行合法JSON</tool_call>
   - 关键要求（必须100%遵守）：
@@ -554,33 +564,40 @@ async function main() {
     <tool_call name="save_note">{"title": "笔记", "body": "第一行\\n第二行，引用\\"内容\\"结束"}</tool_call>
   如果任务已完成，请输出“任务已完成”。`;
 
-        reply = await sendAndWait(retryPrompt, cancelState);
-        if (reply && reply.trim()) {
-          rawOutput = reply.trim();
-        } else {
-          console.log('[ToolCall] 纠正请求未获得有效回复，保留上一轮输出');
-        }
-        console.log('[HTTP] 纠正后输出:', rawOutput);
-
-        // 格式纠正过程中也可能输出“任务已完成”
-        if (rawOutput.includes('任务已完成')) {
-          const cleaned = cleanTaskCompletedMark(rawOutput);
-          if (cleaned) {
-            console.log('[ToolCall] 格式纠正时返回任务完成标记，清洗后返回');
-            return { toolCall: null, rawOutput: cleaned };
+          reply = await sendAndWait(retryPrompt, cancelState);
+          if (reply && reply.trim()) {
+            rawOutput = reply.trim();
           } else {
-            const fallback = cleanTaskCompletedMark(firstOutput) || '';
-            console.log('[ToolCall] 格式纠正时仅返回“任务已完成”，回退到首次正常输出');
-            return { toolCall: null, rawOutput: fallback };
+            console.log('[ToolCall] 纠正请求未获得有效回复，保留上一轮输出');
+          }
+          console.log('[HTTP] 纠正后输出:', rawOutput);
+
+          // 格式纠正过程中也可能输出“任务已完成”
+          if (rawOutput.includes('任务已完成')) {
+            const cleaned = cleanTaskCompletedMark(rawOutput);
+            if (cleaned) {
+              console.log('[ToolCall] 格式纠正时返回任务完成标记，清洗后返回');
+              return { toolCall: null, rawOutput: cleaned };
+            } else {
+              const fallback = cleanTaskCompletedMark(firstOutput) || '';
+              console.log('[ToolCall] 格式纠正时仅返回“任务已完成”，回退到首次正常输出');
+              return { toolCall: null, rawOutput: fallback };
+            }
+          }
+
+          parseResult = parseToolCall(rawOutput, toolNames);
+          // 如果模型不再输出工具调用，则结束循环，返回纯文本
+          if (!parseResult.found) {
+            console.log('[ToolCall] 模型在纠正过程中停止输出工具调用，结束流程');
+            // 确保返回的文本中不包含残留的工具调用标签
+            const cleanedOutput = rawOutput.replace(/<tool_call[^>]*>[\s\S]*?<\/tool_call>/gi, '');
+            return { toolCall: null, rawOutput: cleanedOutput.trim() || rawOutput };
           }
         }
-
-        parseResult = parseToolCall(rawOutput, toolNames);
-        // 如果模型依然没有输出工具调用，设置一个明确的错误，继续下一轮纠正
-        if (!parseResult.found) {
-          console.log('[ToolCall] 模型仍未输出工具调用，继续要求...');
-          parseResult = { found: false, success: false, error: '仍未看到工具调用，必须输出 <tool_call name="...">...</tool_call>' };
-        }
+      } else {
+        // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
+        const cleaned = cleanTaskCompletedMark(rawOutput);
+        return { toolCall: null, rawOutput: cleaned || rawOutput };
       }
     }
 
