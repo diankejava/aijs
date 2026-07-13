@@ -448,17 +448,12 @@ async function main() {
             try {
               parsedArgs = JSON.parse(fixedArgs);
             } catch (e2) {
-              if (e2.message.includes('Invalid escape') || e2.message.includes('Unexpected token')) {
-                const unsafeBackslash = /(?<!\\)\\(?!["\\/bfnrtu])/g;
-                fixedArgs = fixedArgs.replace(unsafeBackslash, '\\\\');
-                try {
-                  parsedArgs = JSON.parse(fixedArgs);
-                } catch (e3) {
-                  results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
-                  searchFrom = closeIdx + tag.close.length;
-                  continue;
-                }
-              } else {
+              // 尝试修复未转义的反斜杠（例如 Windows 路径中的 \R, \g 等非法转义）
+              const unsafeBackslash = /(?<!\\)\\(?!["\\/])/g;
+              fixedArgs = fixedArgs.replace(unsafeBackslash, '\\\\');
+              try {
+                parsedArgs = JSON.parse(fixedArgs);
+              } catch (e3) {
                 results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
                 searchFrom = closeIdx + tag.close.length;
                 continue;
