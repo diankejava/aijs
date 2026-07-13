@@ -454,7 +454,7 @@ async function main() {
               try {
                 parsedArgs = JSON.parse(fixedArgs);
               } catch (e3) {
-                results.push({ success: false, error: `参数 JSON 解析失败：${e.message},失败的JSON: ${rawArgs}` });
+                results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
                 searchFrom = closeIdx + tag.close.length;
                 continue;
               }
