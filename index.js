@@ -706,6 +706,14 @@ async function main() {
   - 多工具正确示例：
     <tool_call name="glob">{"path": "E:\\\\project", "pattern": "**/*.java"}</tool_call>
     <tool_call name="read">{"filePath": "E:\\\\project\\\\Main.java", "offset": 1, "limit": 50}</tool_call>
+
+  【执行修改后必须验证】
+  - 如果你调用了任何修改文件系统、数据库或配置的工具（如 write_file, replace_content, execute_command 等），在收到工具执行结果后，你必须紧接着调用读取或检查工具来验证修改是否成功。
+  - 验证成功后，你可以输出简短的确认信息（如“文件已成功修改”）；如果验证失败，必须报告具体错误。
+  - 示例流程（修改文件后读取验证）：
+    <tool_call name="replace_content">{"filePath": "E:\\\\project\\\\App.java", "old_str": "...", "new_str": "..."}</tool_call>
+    <tool_call name="read">{"filePath": "E:\\\\project\\\\App.java", "offset": 1, "limit": 30}</tool_call>
+
   【绝对禁止的格式（会导致严重错误）】
   1. 禁止使用 <tool_calls>、<invoke>、<parameter>、<function_call> 等任何其他标签，只能使用 <tool_call>。
   2. 禁止在标签内使用 XML 属性（如 string="true"），参数必须全部写在 JSON 对象中。
