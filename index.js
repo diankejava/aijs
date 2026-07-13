@@ -448,15 +448,53 @@ async function main() {
             try {
               parsedArgs = JSON.parse(fixedArgs);
             } catch (e2) {
-              // 尝试修复未转义的反斜杠（例如 Windows 路径中的 \R, \g 等非法转义）
-              const unsafeBackslash = /(?<!\\)\\(?!["\\/])/g;
-              fixedArgs = fixedArgs.replace(unsafeBackslash, '\\\\');
+              // 安全修复未转义的反斜杠（兼容所有 Node.js 版本）
+              let rebuilt = '';
+              for (let i = 0; i < fixedArgs.length; i++) {
+                const ch = fixedArgs[i];
+                if (ch === '\\') {
+                  // 如果后面是合法转义字符（仅限 JSON 结构必需的 "、\、/）则不修复，否则替换为 \\
+                  const next = fixedArgs[i + 1];
+                  if (next === '"' || next === '\\' || next === '/') {
+                    rebuilt += '\\';
+                  } else {
+                    rebuilt += '\\\\';
+                  }
+                } else {
+                  rebuilt += ch;
+                }
+              }
               try {
-                parsedArgs = JSON.parse(fixedArgs);
+                parsedArgs = JSON.parse(rebuilt);
               } catch (e3) {
-                results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
-                searchFrom = closeIdx + tag.close.length;
-                continue;
+                try {
+                  parsedArgs = JSON.parse(rebuilt);
+                } catch (e3) {
+                  // 反斜杠修复后仍失败，尝试修复未转义的双引号（仅限明显的 XML 属性模式）
+                  let rebuilt2 = rebuilt;
+                  // 检测是否包含类似 property="value" 的未转义引号
+                  if (/="[^"\\]*(?:\\.[^"\\]*)*"/.test(rebuilt2)) {
+                    // 替换 "=" 后面的引号对中的内层引号：将 ="value" 中的双引号改为 \"
+                    // 注意：此正则仅针对简单的属性值，并不通用，但能覆盖大多数情况
+                    rebuilt2 = rebuilt2.replace(/("[^"]*")/g, (match) => {
+                      // 如果是字符串值，将内部的裸双引号（除了首尾）转义
+                      return match.replace(/(?<=[^\\])"(?=[^"]*"(?=[,\s\r\n}]))/g, '\\"');
+                    });
+                    try {
+                      parsedArgs = JSON.parse(rebuilt2);
+                      // 修复成功，跳过错误记录
+                      // 注意：此时 parsedArgs 已被赋值，后续代码不再进入错误分支
+                    } catch (e4) {
+                      results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
+                      searchFrom = closeIdx + tag.close.length;
+                      continue;
+                    }
+                  } else {
+                    results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
+                    searchFrom = closeIdx + tag.close.length;
+                    continue;
+                  }
+                }
               }
             }
           }
@@ -546,8 +584,19 @@ async function main() {
           const failedJsonMatch = errorDetail.match(/失败的JSON:\s*(.*)/);
           if (failedJsonMatch) {
             const failedJson = failedJsonMatch[1].trim();
-            const fixedJson = failedJson.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
-            fixExample = `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}\n  【修正后应写为】：${fixedJson.slice(0, 200)}`;
+            let fixedJson = failedJson.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+            // 如果错误输出中疑似包含未转义的双引号（如 XML 属性），额外进行提示并展示正确转义
+            const hasUnescapedQuote = /"[^"\\]*(?:\\.[^"\\]*)*"/g.test(failedJson) && // 有字符串值
+                                      /="[^"]*"/.test(failedJson); // 且包含 ="..."
+            if (hasUnescapedQuote) {
+              fixExample = `\n  【双引号转义错误】你的 JSON 字符串值内包含了未转义的双引号，如：property="createTime"。` +
+                `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}` +
+                `\n  【修正后应写为】请将值内部的双引号全部写成 \\"，例如 property=\\"createTime\\"。` +
+                `\n  下面是你应该输出的完整 JSON（所有双引号已正确转义）：` +
+                `\n  ${fixedJson.replace(/="/g, '=\\"').replace(/"\s/g, '\\" ').replace(/"\//g, '\\"/').replace(/"\n/g, '\\"\n')}`;
+            } else {
+              fixExample = `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}\n  【修正后应写为】：${fixedJson.slice(0, 200)}`;
+            }
           }
           const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用，必须严格按照要求】\n` +
             `上一轮你的工具调用格式错误，具体错误：${parseResult.error}${fixExample}\n` +
@@ -703,6 +752,9 @@ async function main() {
     <tool_call name="send_message">{"content": "他说：\\"你好，世界\\"\\n第二行内容"}</tool_call>
   - 正确示例（多参数无特殊字符）：
     <tool_call name="search">{"query": "今天天气", "limit": 5}</tool_call>
+  - 特别注意：如果你的 old_str、new_str、content 等参数包含 XML 或 HTML 标签，其中的属性必须转义双引号。
+    错误：{"oldString": "<result property="createTime" />"}
+    正确：{"oldString": "<result property=\\"createTime\\" />"}
   - 多工具正确示例：
     <tool_call name="glob">{"path": "E:\\\\project", "pattern": "**/*.java"}</tool_call>
     <tool_call name="read">{"filePath": "E:\\\\project\\\\Main.java", "offset": 1, "limit": 50}</tool_call>
