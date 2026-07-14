@@ -342,6 +342,37 @@ async function main() {
       await editor.press('Enter');
     }
 
+
+    // 新增：自动检测并点击重试按钮（最多尝试 10 次，每次间隔 2 秒）
+    const retryCheckInterval = 2000;
+    const retryMaxAttempts = 10;
+    for (let retryAttempt = 0; retryAttempt < retryMaxAttempts; retryAttempt++) {
+      await page.waitForTimeout(retryCheckInterval);
+      if (cancelState && cancelState.cancelled) break;
+
+      const maybeReply = await page.evaluate(() => {
+        const items = document.querySelectorAll('[data-virtual-list-item-key]');
+        if (!items.length) return false;
+        const last = items[items.length - 1];
+        return !!last.querySelector('.ds-assistant-message-main-content');
+      });
+      if (maybeReply) break;
+
+      // 更精准的选择器：图标路径 + 警告样式按钮
+      let retryBtn = page.locator('[role="button"].ds-button--warning .ds-icon svg path[d^="M1.272 6.21348"]');
+      if (await retryBtn.count() === 0) {
+        // 备用：直接匹配包含图标的按钮
+        retryBtn = page.locator('[role="button"]').filter({
+          has: page.locator('.ds-icon svg path[d^="M1.272 6.21348"]')
+        });
+      }
+      if (await retryBtn.count() > 0) {
+        console.log('[HTTP] 检测到重试按钮，自动点击重试...');
+        await retryBtn.first().click({ force: true });
+        retryAttempt = -1; // 重置，继续监测
+      }
+    }
+
     // 通过页面上下文检测超限提示（不依赖类名）
     const isOverLimit = await page.evaluate(() => {
         const spans = document.querySelectorAll('span');
@@ -448,13 +479,13 @@ async function main() {
             try {
               parsedArgs = JSON.parse(fixedArgs);
             } catch (e2) {
-              // 安全修复未转义的反斜杠（兼容所有 Node.js 版本）
+              // 步骤1：修复未转义的反斜杠（Windows 路径等）
               let rebuilt = '';
               for (let i = 0; i < fixedArgs.length; i++) {
                 const ch = fixedArgs[i];
                 if (ch === '\\') {
-                  // 如果后面是合法转义字符（仅限 JSON 结构必需的 "、\、/）则不修复，否则替换为 \\
                   const next = fixedArgs[i + 1];
+                  // 保留所有 JSON 合法转义字符：", \, /, b, f, n, r, t, u
                   if (next === '"' || next === '\\' || next === '/') {
                     rebuilt += '\\';
                   } else {
@@ -467,32 +498,89 @@ async function main() {
               try {
                 parsedArgs = JSON.parse(rebuilt);
               } catch (e3) {
-                try {
-                  parsedArgs = JSON.parse(rebuilt);
-                } catch (e3) {
-                  // 反斜杠修复后仍失败，尝试修复未转义的双引号（仅限明显的 XML 属性模式）
-                  let rebuilt2 = rebuilt;
-                  // 检测是否包含类似 property="value" 的未转义引号
-                  if (/="[^"\\]*(?:\\.[^"\\]*)*"/.test(rebuilt2)) {
-                    // 替换 "=" 后面的引号对中的内层引号：将 ="value" 中的双引号改为 \"
-                    // 注意：此正则仅针对简单的属性值，并不通用，但能覆盖大多数情况
-                    rebuilt2 = rebuilt2.replace(/("[^"]*")/g, (match) => {
-                      // 如果是字符串值，将内部的裸双引号（除了首尾）转义
-                      return match.replace(/(?<=[^\\])"(?=[^"]*"(?=[,\s\r\n}]))/g, '\\"');
-                    });
-                    try {
-                      parsedArgs = JSON.parse(rebuilt2);
-                      // 修复成功，跳过错误记录
-                      // 注意：此时 parsedArgs 已被赋值，后续代码不再进入错误分支
-                    } catch (e4) {
+                // 步骤2：尝试修复未转义的双引号（常见于 XML 属性值）
+                let rebuilt2 = rebuilt;
+                // 检测是否包含类似 property="value" 的模式
+                if (/="[^"]*"/.test(rebuilt2)) {
+                  // 将 ="..." 形式的属性值内部的双引号转义
+                  rebuilt2 = rebuilt2.replace(/=("[^"]*")/g, (fullMatch, quoted) => {
+                    // 把 quoted 里面的所有双引号转义为 \"
+                    return '=' + quoted.replace(/"/g, '\\"');
+                  });
+                  try {
+                    parsedArgs = JSON.parse(rebuilt2);
+                  } catch (e4) {
+                    results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
+                    searchFrom = closeIdx + tag.close.length;
+                    continue;
+                  }
+                } else {
+                  // 步骤3：通用嵌套双引号修复（状态机扫描字符串值内部）
+                  const fixNestedQuotes = (jsonStr) => {
+                    let result = '';
+                    let inString = false;
+                    let prevBackslash = false; // 前一个字符是否是反斜杠（在字符串内）
+                    for (let i = 0; i < jsonStr.length; i++) {
+                      const ch = jsonStr[i];
+                      if (!inString) {
+                        if (ch === '"') {
+                          inString = true;
+                          prevBackslash = false;
+                          result += ch;
+                        } else {
+                          result += ch;
+                        }
+                      } else {
+                        if (prevBackslash) {
+                          // 前一个字符是反斜杠，当前字符被转义，直接输出
+                          result += ch;
+                          prevBackslash = false;
+                        } else if (ch === '\\') {
+                          // 遇到反斜杠，可能是转义开始
+                          prevBackslash = true;
+                          result += ch;
+                        } else if (ch === '"') {
+                          // 前瞻判断是否为字符串结束
+                          let j = i + 1;
+                          while (j < jsonStr.length && /\s/.test(jsonStr[j])) j++;
+                          const nextCh = jsonStr[j];
+                          if (nextCh === ':' || nextCh === ',' || nextCh === '}' || nextCh === ']' || j === jsonStr.length) {
+                            // 确实是字符串结束
+                            inString = false;
+                            result += '"';
+                          } else {
+                            // 内部未转义的双引号，自动添加转义
+                            result += '\\"';
+                          }
+                        } else {
+                          result += ch;
+                        }
+                      }
+                    }
+                    return result;
+                  };
+                  const rebuilt3 = fixNestedQuotes(rebuilt2);
+                  try {
+                    parsedArgs = JSON.parse(rebuilt3);
+                  } catch (e5) {
+                    // 步骤4：尝试修复常见的 Java 代码 content 字段中的双引号
+                    if (/\"content\"\s*:\s*\"[^"]*\\/.test(rebuilt2)) { // 粗略检测 content 字段存在且内含代码
+                      const contentFix = rebuilt2.replace(/("content"\s*:\s*")([^"]*?)(")/g, (match, key, val, endQuote) => {
+                        // 将 val 中的所有双引号转义
+                        return key + val.replace(/"/g, '\\"') + endQuote;
+                      });
+                      try {
+                        parsedArgs = JSON.parse(contentFix);
+                      } catch (e6) {
+                        results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
+                        searchFrom = closeIdx + tag.close.length;
+                        continue;
+                      }
+                    } else {
                       results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
                       searchFrom = closeIdx + tag.close.length;
                       continue;
                     }
-                  } else {
-                    results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
-                    searchFrom = closeIdx + tag.close.length;
-                    continue;
                   }
                 }
               }
@@ -504,6 +592,20 @@ async function main() {
           } else if (allowedNames.length > 0 && !allowedNames.includes(rawName)) {
             results.push({ success: false, error: `无效的函数名 "${rawName}"，允许的函数名：${allowedNames.join(', ')}` });
           } else {
+            // 如果解析成功，清理字符串中可能被错误转义的换行/制表符
+            if (typeof parsedArgs === 'object' && parsedArgs !== null) {
+              const fixStringValues = (obj) => {
+                for (const key of Object.keys(obj)) {
+                  if (typeof obj[key] === 'string') {
+                    obj[key] = obj[key].replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
+                  } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+                    fixStringValues(obj[key]);
+                  }
+                }
+              };
+              fixStringValues(parsedArgs);
+            }
+            // 然后推入结果
             results.push({ success: true, toolCall: { name: rawName, arguments: parsedArgs } });
           }
           searchFrom = closeIdx + tag.close.length;
@@ -606,7 +708,11 @@ async function main() {
   - 关键要求（必须100%遵守）：
     0. 严禁使用 <tool_calls>、<invoke>、<parameter> 等任何其他标签，只允许 <tool_call name="函数名">JSON</tool_call>。
     1. 路径中的反斜杠必须写成 \\\\，例如 "E:\\\\geo-boot\\\\..."，绝对不能只写单个 \\。
-    2. JSON 字符串内所有的英文双引号必须写成 \\" 转义，例如："他说：\\"你好\\""。
+    2. 如果 JSON 字符串内需要包含双引号（例如 Java 代码、命令行参数），必须将内部的双引号写成 \\" 转义，或者改用单引号。
+       - 错误（Java 代码未转义）：{"content": "... @ApiModelProperty(value = "主键") ..."}
+       - 正确：{"content": "... @ApiModelProperty(value = \\"主键\\") ..."}
+       - 命令行错误：{"command": "echo "hello""}
+       - 命令行正确：{"command": "echo \\"hello\\""} 或 {"command": "echo 'hello'"}
     3. 如果内容包含换行，必须使用 \\n 转义，绝对禁止输入真实换行符（按回车）。
     4. JSON 不能有多余逗号，不能换行，不能缩进，必须紧凑在一行。
     5. 不要输出任何解释、道歉、感叹词，只输出这一行调用。
@@ -636,9 +742,9 @@ async function main() {
 
           parseResult = parseToolCall(rawOutput, toolNames);
           if (!parseResult.found) {
-            console.log('[ToolCall] 模型在纠正过程中停止输出工具调用，结束流程');
-            const cleanedOutput = rawOutput.replace(/<tool_call[^>]*>[\s\S]*?<\/tool_call>/gi, '');
-            return { toolCall: null, toolCalls: [], rawOutput: cleanedOutput.trim() || rawOutput };
+            console.log('[ToolCall] 模型仍未输出工具调用，继续要求...');
+            parseResult = { found: false, success: false, error: '仍未看到工具调用，必须输出 <tool_call name="...">...</tool_call>' };
+            // return { toolCall: null, toolCalls: [], rawOutput: cleanedOutput.trim() || rawOutput };
           }
         }
       } else {
@@ -695,6 +801,7 @@ async function main() {
             const tools = data.tools || [];
             const toolNames = tools.map(t => t.function.name);
 
+            console.log('[HTTP] 可用工具:', toolNames.join(', '));
             if (!userMsg) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: { message: 'No message content', type: 'invalid_request_error' } }));
@@ -753,6 +860,7 @@ async function main() {
   - 正确示例（多参数无特殊字符）：
     <tool_call name="search">{"query": "今天天气", "limit": 5}</tool_call>
   - 特别注意：如果你的 old_str、new_str、content 等参数包含 XML 或 HTML 标签，其中的属性必须转义双引号。
+  - 如果你的 content 参数包含 Java 代码或任何含双引号的文本，请务必将代码中的每一个双引号都写成 \\" 转义，否则 JSON 无法解析。
     错误：{"oldString": "<result property="createTime" />"}
     正确：{"oldString": "<result property=\\"createTime\\" />"}
   - 多工具正确示例：
