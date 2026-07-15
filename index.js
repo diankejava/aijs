@@ -177,41 +177,76 @@ async function main() {
           console.log('\x1b[35m[DEBUG] 检测到完成信号，等待内容稳定...\x1b[0m');
           await page.waitForTimeout(300);
           let reply = await page.evaluate(() => {
+              // 递归遍历 DOM，在块级元素和 <br> 后自动插入换行
+              function extractTextWithLineBreaks(el) {
+                  if (!el) return '';
+                  let text = '';
+                  for (const node of el.childNodes) {
+                      if (node.nodeType === Node.TEXT_NODE) {
+                          text += node.textContent;
+                      } else if (node.nodeType === Node.ELEMENT_NODE) {
+                          const tag = node.tagName.toLowerCase();
+                          if (tag === 'br') {
+                              text += '\n';
+                              continue;
+                          }
+                          const innerText = extractTextWithLineBreaks(node);
+                          const blockTags = ['p','div','h1','h2','h3','h4','h5','h6','li','section','article','header','footer'];
+                          if (blockTags.includes(tag)) {
+                              text += innerText + '\n';
+                          } else {
+                              text += innerText;
+                          }
+                      }
+                  }
+                  return text;
+              }
+
               const items = document.querySelectorAll('[data-virtual-list-item-key]');
+              if (!items.length) return '';
               const last = items[items.length - 1];
               const main = last.querySelector('.ds-assistant-message-main-content');
               if (!main) return '';
 
-              // 优先从 innerHTML 中提取 <tool_call> 标签，因为 DeepSeek 可能使用实体编码
-              const rawHTML = main.innerHTML;
-              const toolCallMatch = rawHTML.match(/&lt;tool_call&gt;([\s\S]*?)&lt;\/tool_call&gt;/i);
-              
-              // 有工具调用时用 textContent，纯文本回复时用 innerText 保留换行
-              let text = toolCallMatch
-                ? main.textContent.trim()
-                : main.innerText.trim();
-
-              text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
-              // 清洗页面 UI 杂讯（常见按钮文字、语言标签等）
-              text = text.replace(/^(复制|下载|运行|调试|代码|powershell|bash|python|javascript|typescript|css|html|json|yaml|xml|markdown|shell|cmd|sh|java|cpp|csharp|go|rust|ruby|php|sql|swift|kotlin|scala|r|perl|lua|dart|plaintext|text|diff|patch|ini|toml|env|nginx|apache|makefile|dockerfile|yml)$/gmi, '');
-              if (text.includes('User:') || text.includes('Assistant:')) return '';
+              let text = extractTextWithLineBreaks(main).trim();
+              // 清洗操作已移至 getFinalReplyWithTools，此处只返回原始文本
               return text;
           });
 
           if (!reply) {
             await page.waitForTimeout(500);
             reply = await page.evaluate(() => {
+              function extractTextWithLineBreaks(el) {
+                  if (!el) return '';
+                  let text = '';
+                  for (const node of el.childNodes) {
+                      if (node.nodeType === Node.TEXT_NODE) {
+                          text += node.textContent;
+                      } else if (node.nodeType === Node.ELEMENT_NODE) {
+                          const tag = node.tagName.toLowerCase();
+                          if (tag === 'br') {
+                              text += '\n';
+                              continue;
+                          }
+                          const innerText = extractTextWithLineBreaks(node);
+                          const blockTags = ['p','div','h1','h2','h3','h4','h5','h6','li','section','article','header','footer'];
+                          if (blockTags.includes(tag)) {
+                              text += innerText + '\n';
+                          } else {
+                              text += innerText;
+                          }
+                      }
+                  }
+                  return text;
+              }
+
               const items = document.querySelectorAll('[data-virtual-list-item-key]');
+              if (!items.length) return '';
               const last = items[items.length - 1];
               const main = last.querySelector('.ds-assistant-message-main-content');
               if (!main) return '';
-              const rawHTML2 = main.innerHTML;
-              const hasToolCall2 = /<tool_call/i.test(rawHTML2);
-              let text = hasToolCall2
-                ? main.textContent.trim()
-                : main.innerText.trim();
-              text = text.replace(/专家模式暂不支持搜索，请使用快速模式/g, '').trim();
-              text = text.replace(/^(复制|下载|运行|调试|代码|powershell|bash|python|javascript|typescript|css|html|json|yaml|xml|markdown|shell|cmd|sh|java|cpp|csharp|go|rust|ruby|php|sql|swift|kotlin|scala|r|perl|lua|dart|plaintext|text|diff|patch|ini|toml|env|nginx|apache|makefile|dockerfile|yml)$/gmi, '');
+              let text = extractTextWithLineBreaks(main).trim();
+              // 清洗操作已移至 getFinalReplyWithTools
               if (text.includes('User:') || text.includes('Assistant:')) return '';
               return text;
             });
@@ -435,189 +470,130 @@ async function main() {
       return JSON.parse(safeText);
     }
 
-    // 解析模型输出中的工具调用（新格式：<tool_call name="函数名">参数JSON</tool_call>）
+    // 解析模型输出中的工具调用（新格式：<tool_call name="函数名">====== 参数名 ++++++ 参数值 </tool_call>）
     function parseToolCall(text, allowedNames = []) {
       if (!text) return { found: false, success: false, toolCalls: [], toolCall: null };
 
       const results = [];
-      const decodeEntities = (str) => {
-        return str.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-                  .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
-                  .replace(/&#39;/g, "'");
-      };
 
-      const openTags = [
-        { prefix: '<tool_call name="', suffix: '">', close: '</tool_call>' },
-        { prefix: '&lt;tool_call name="', suffix: '"&gt;', close: '&lt;/tool_call&gt;' }
-      ];
+      // 支持用任意数量的 = 或 + 组成的独立行作为分隔符
+      const parseKeyValueArgs = (text) => {
+        const args = {};
+        const lines = text.split('\n');
+        let currentKey = null;
+        let currentValueLines = [];
 
-      for (const tag of openTags) {
-        let searchFrom = 0;
-        while (true) {
-          const startIdx = text.indexOf(tag.prefix, searchFrom);
-          if (startIdx === -1) break;
+        const flush = () => {
+          if (currentKey) {
+            let value = currentValueLines.join('\n').trim();
+            // 去除末尾空行
+            value = value.replace(/\n+$/, '');
+            // 智能类型转换：纯数字字符串自动转 Number
+            const cleanedValue = value.replace(/\s+/g, '');
+            const numVal = Number(cleanedValue);
+            if (cleanedValue !== '' && !isNaN(numVal) && String(numVal) === cleanedValue) {
+              args[currentKey] = numVal;
+            } else {
+              args[currentKey] = value;
+            }
+            currentKey = null;
+            currentValueLines = [];
+          }
+        };
 
-          const nameEnd = text.indexOf(tag.suffix, startIdx + tag.prefix.length);
-          if (nameEnd === -1) break;
-
-          const rawName = text.substring(startIdx + tag.prefix.length, nameEnd).trim();
-          if (!rawName) {
-            results.push({ success: false, error: 'name 属性不能为空' });
-            searchFrom = nameEnd + tag.suffix.length;
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          // 判断当前行是否以 = 开头（至少一个），视为参数分隔行，忽略其后内容
+          if (/^=+/.test(line.trim())) {
+            flush();
+            continue;
+          }
+          // 判断当前行是否以 + 开头（至少一个），视为键值分隔行，忽略其后内容
+          if (/^\++/.test(line.trim())) {
+            if (currentKey) {
+              continue; // 加号行本身不存储，直接跳过
+            }
             continue;
           }
 
-          const closeIdx = text.indexOf(tag.close, nameEnd + tag.suffix.length);
-          if (closeIdx === -1) break;
-
-          const rawArgs = text.substring(nameEnd + tag.suffix.length, closeIdx).trim();
-          let parsedArgs;
-          try {
-            parsedArgs = JSON.parse(decodeEntities(rawArgs));
-          } catch (e) {
-            let fixedArgs = rawArgs.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-            try {
-              parsedArgs = JSON.parse(fixedArgs);
-            } catch (e2) {
-              // 步骤1：修复未转义的反斜杠（Windows 路径等）
-              let rebuilt = '';
-              for (let i = 0; i < fixedArgs.length; i++) {
-                const ch = fixedArgs[i];
-                if (ch === '\\') {
-                  const next = fixedArgs[i + 1];
-                  // 保留所有 JSON 合法转义字符：", \, /, b, f, n, r, t, u
-                  if (next === '"' || next === '\\' || next === '/') {
-                    rebuilt += '\\';
-                  } else {
-                    rebuilt += '\\\\';
-                  }
-                } else {
-                  rebuilt += ch;
-                }
-              }
-              try {
-                parsedArgs = JSON.parse(rebuilt);
-              } catch (e3) {
-                // 步骤2：尝试修复未转义的双引号（常见于 XML 属性值）
-                let rebuilt2 = rebuilt;
-                // 检测是否包含类似 property="value" 的模式
-                if (/="[^"]*"/.test(rebuilt2)) {
-                  // 将 ="..." 形式的属性值内部的双引号转义
-                  rebuilt2 = rebuilt2.replace(/=("[^"]*")/g, (fullMatch, quoted) => {
-                    // 把 quoted 里面的所有双引号转义为 \"
-                    return '=' + quoted.replace(/"/g, '\\"');
-                  });
-                  try {
-                    parsedArgs = JSON.parse(rebuilt2);
-                  } catch (e4) {
-                    results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
-                    searchFrom = closeIdx + tag.close.length;
-                    continue;
-                  }
-                } else {
-                  // 步骤3：通用嵌套双引号修复（状态机扫描字符串值内部）
-                  const fixNestedQuotes = (jsonStr) => {
-                    let result = '';
-                    let inString = false;
-                    let prevBackslash = false; // 前一个字符是否是反斜杠（在字符串内）
-                    for (let i = 0; i < jsonStr.length; i++) {
-                      const ch = jsonStr[i];
-                      if (!inString) {
-                        if (ch === '"') {
-                          inString = true;
-                          prevBackslash = false;
-                          result += ch;
-                        } else {
-                          result += ch;
-                        }
-                      } else {
-                        if (prevBackslash) {
-                          // 前一个字符是反斜杠，当前字符被转义，直接输出
-                          result += ch;
-                          prevBackslash = false;
-                        } else if (ch === '\\') {
-                          // 遇到反斜杠，可能是转义开始
-                          prevBackslash = true;
-                          result += ch;
-                        } else if (ch === '"') {
-                          // 前瞻判断是否为字符串结束
-                          let j = i + 1;
-                          while (j < jsonStr.length && /\s/.test(jsonStr[j])) j++;
-                          const nextCh = jsonStr[j];
-                          if (nextCh === ':' || nextCh === ',' || nextCh === '}' || nextCh === ']' || j === jsonStr.length) {
-                            // 确实是字符串结束
-                            inString = false;
-                            result += '"';
-                          } else {
-                            // 内部未转义的双引号，自动添加转义
-                            result += '\\"';
-                          }
-                        } else {
-                          result += ch;
-                        }
-                      }
-                    }
-                    return result;
-                  };
-                  const rebuilt3 = fixNestedQuotes(rebuilt2);
-                  try {
-                    parsedArgs = JSON.parse(rebuilt3);
-                  } catch (e5) {
-                    // 步骤4：尝试修复常见的 Java 代码 content 字段中的双引号
-                    if (/\"content\"\s*:\s*\"[^"]*\\/.test(rebuilt2)) { // 粗略检测 content 字段存在且内含代码
-                      const contentFix = rebuilt2.replace(/("content"\s*:\s*")([^"]*?)(")/g, (match, key, val, endQuote) => {
-                        // 将 val 中的所有双引号转义
-                        return key + val.replace(/"/g, '\\"') + endQuote;
-                      });
-                      try {
-                        parsedArgs = JSON.parse(contentFix);
-                      } catch (e6) {
-                        results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
-                        searchFrom = closeIdx + tag.close.length;
-                        continue;
-                      }
-                    } else {
-                      results.push({ success: false, error: `参数 JSON 解析失败，如果JSON中有单斜杆\\注意要转义：${e.message},失败的JSON: ${rawArgs}` });
-                      searchFrom = closeIdx + tag.close.length;
-                      continue;
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          if (typeof parsedArgs !== 'object' || parsedArgs === null) {
-            results.push({ success: false, error: 'arguments 必须是一个 JSON 对象' });
-          } else if (allowedNames.length > 0 && !allowedNames.includes(rawName)) {
-            results.push({ success: false, error: `无效的函数名 "${rawName}"，允许的函数名：${allowedNames.join(', ')}` });
+          // 正常行
+          if (!currentKey) {
+            // 还没有 key，则本行作为 key（去除首尾空白及所有内部空白）
+            currentKey = line.trim().replace(/\s+/g, '');
           } else {
-            // 如果解析成功，清理字符串中可能被错误转义的换行/制表符
-            if (typeof parsedArgs === 'object' && parsedArgs !== null) {
-              const fixStringValues = (obj) => {
-                for (const key of Object.keys(obj)) {
-                  if (typeof obj[key] === 'string') {
-                    obj[key] = obj[key].replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-                  } else if (typeof obj[key] === 'object' && obj[key] !== null) {
-                    fixStringValues(obj[key]);
-                  }
-                }
-              };
-              fixStringValues(parsedArgs);
-            }
-            // 然后推入结果
-            results.push({ success: true, toolCall: { name: rawName, arguments: parsedArgs } });
+            // 已有 key，追加到 value 行
+            currentValueLines.push(line);
           }
-          searchFrom = closeIdx + tag.close.length;
+        }
+        flush(); // 处理最后一个参数
+        return Object.keys(args).length > 0 ? args : null;
+      };
+
+      // 清理 <tool_call name="... "> 中引号与 > 之间的换行/空格，防止解析失败
+      text = text.replace(/(<tool_call\s+name\s*=\s*")([^"]*)("\s*)(>)/gi, (m, p1, name, p3, p4) => p1 + name.trim() + '">');
+      // 正则匹配完整的 <tool_call name="函数名"> ... </tool_call>（支持换行）
+      const toolCallRegex = /<tool_call\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/tool_call>/gi;
+      let match;
+      while ((match = toolCallRegex.exec(text)) !== null) {
+        const rawName = match[1].trim();
+        const rawArgs = match[2].trim();
+
+        if (!rawName) {
+          results.push({ success: false, error: 'name 属性不能为空' });
+          continue;
+        }
+        if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(rawName)) {
+          results.push({ success: false, error: `无效的函数名格式 "${rawName}"，函数名只能包含字母、数字和下划线` });
+          continue;
+        }
+        if (allowedNames.length > 0 && !allowedNames.includes(rawName)) {
+          results.push({ success: false, error: `无效的函数名 "${rawName}"，允许的函数名：${allowedNames.join(', ')}` });
+          continue;
+        }
+
+        // 预处理分隔符（自动补换行）：保证每个 = 或 + 块前后有换行，数量不限
+        let fixedArgs = rawArgs
+          .replace(/([^\n])(=+)([^\n])/g, '$1\n$2\n$3')
+          .replace(/([^\n])(=+)$/gm, '$1\n$2')
+          .replace(/^(=+)([^\n])/gm, '$1\n$2')
+          .replace(/([^\n])(\++)([^\n])/g, '$1\n$2\n$3')
+          .replace(/([^\n])(\++)$/gm, '$1\n$2')
+          .replace(/^(\++)([^\n])/gm, '$1\n$2');
+        // 确保首尾有换行
+        fixedArgs = '\n' + fixedArgs + '\n';
+
+        const parsedArgs = parseKeyValueArgs(fixedArgs);
+        if (!parsedArgs) {
+          results.push({ success: false, error: `参数格式错误，请使用 ====== / ++++++ 分隔格式，失败的参数文本：${rawArgs.slice(0, 100)}` });
+        } else {
+          // 额外校验：只保留合法的参数名，并丢弃完全无效的键
+          const validArgs = {};
+          let hasInvalidKey = false;
+          for (const [k, v] of Object.entries(parsedArgs)) {
+            if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(k)) {
+              validArgs[k] = v;
+            } else {
+              console.log('[ToolCall] 忽略非法参数名:', k);
+              hasInvalidKey = true;
+            }
+          }
+          if (Object.keys(validArgs).length === 0) {
+            results.push({ success: false, error: `参数格式错误，未提取到有效参数名，失败的参数文本：${rawArgs.slice(0, 100)}` });
+          } else {
+            if (hasInvalidKey) {
+              console.log('[ToolCall] 部分参数被忽略，已提取的有效参数:', JSON.stringify(validArgs));
+            }
+            results.push({ success: true, toolCall: { name: rawName, arguments: validArgs } });
+          }
         }
       }
 
       if (results.length === 0) {
         if (/<(tool_calls|invoke|parameter|function_call|tool_use)/i.test(text)) {
-          return { found: true, success: false, toolCalls: [], toolCall: null, error: '检测到禁止的标签格式（如 <tool_calls>, <invoke>, <parameter>），必须使用 <tool_call name="函数名">参数JSON</tool_call>' };
+          return { found: true, success: false, toolCalls: [], toolCall: null, error: '检测到禁止的标签格式，必须使用 <tool_call name="函数名">====== ... ++++++ ... </tool_call>' };
         }
         if (text.includes('<tool_call') || text.includes('&lt;tool_call')) {
-          return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <tool_call> 标签但无法解析，正确格式：<tool_call name="函数名">参数JSON</tool_call>' };
+           return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <tool_call> 标签但无法解析，必须使用 ====== / ++++++ 分隔参数' };
         }
         return { found: false, success: false, toolCalls: [], toolCall: null };
       }
@@ -661,7 +637,10 @@ async function main() {
         if (cleanedFirst) {
           // 如果清洗后仍有有效内容，直接返回给客户端（不再继续工具流程）
           console.log('[ToolCall] 首次回复即包含任务完成标记，清洗后返回有效内容');
-          return { toolCall: null, rawOutput: cleanedFirst };
+          let cleanedOutput = cleanedFirst
+            .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
+            .replace(/(复制|下载|运行|调试|代码)/g, '');
+          return { toolCall: null, rawOutput: cleanedOutput };
         } else {
           // 清洗后为空，说明模型只说了“任务已完成”几个字，回退到 firstOutput（但 firstOutput 本身就只是这几个字）
           // 此时没有更早的“正常输出”，只能返回一个空字符串或默认提示，这里返回空字符串让客户端自行处理
@@ -680,46 +659,50 @@ async function main() {
             return { toolCall: parseResult.toolCall, toolCalls: parseResult.toolCalls, rawOutput };
           }
           console.log('[ToolCall] 格式错误，继续纠正...');
-          // 构造修正示例（取第一个失败的）
-          let errorDetail = parseResult.error;
-          let fixExample = '';
-          const failedJsonMatch = errorDetail.match(/失败的JSON:\s*(.*)/);
-          if (failedJsonMatch) {
-            const failedJson = failedJsonMatch[1].trim();
-            let fixedJson = failedJson.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
-            // 如果错误输出中疑似包含未转义的双引号（如 XML 属性），额外进行提示并展示正确转义
-            const hasUnescapedQuote = /"[^"\\]*(?:\\.[^"\\]*)*"/g.test(failedJson) && // 有字符串值
-                                      /="[^"]*"/.test(failedJson); // 且包含 ="..."
-            if (hasUnescapedQuote) {
-              fixExample = `\n  【双引号转义错误】你的 JSON 字符串值内包含了未转义的双引号，如：property="createTime"。` +
-                `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}` +
-                `\n  【修正后应写为】请将值内部的双引号全部写成 \\"，例如 property=\\"createTime\\"。` +
-                `\n  下面是你应该输出的完整 JSON（所有双引号已正确转义）：` +
-                `\n  ${fixedJson.replace(/="/g, '=\\"').replace(/"\s/g, '\\" ').replace(/"\//g, '\\"/').replace(/"\n/g, '\\"\n')}`;
-            } else {
-              fixExample = `\n  【你的错误输出】（已截取）：${failedJson.slice(0, 200)}\n  【修正后应写为】：${fixedJson.slice(0, 200)}`;
-            }
+          let fixExample = ''; // 必须初始化
+          const failedMatch = parseResult.error.match(/失败的参数文本：\s*(.*)/);
+          if (failedMatch) {
+            const failedText = failedMatch[1].trim();
+            fixExample = `\n  【你的错误输出】：${failedText.slice(0, 200)}`;
           }
-          const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 仅输出一行工具调用，必须严格按照要求】\n` +
-            `上一轮你的工具调用格式错误，具体错误：${parseResult.error}${fixExample}\n` +
-            `【请立即按以下规则输出正确的工具调用，整个回复只能有一行，不能有任何其他内容】
-  - 正确格式（单行，无额外文字）：
-    <tool_call name="函数名">单行合法JSON</tool_call>
-  - 关键要求（必须100%遵守）：
-    0. 严禁使用 <tool_calls>、<invoke>、<parameter> 等任何其他标签，只允许 <tool_call name="函数名">JSON</tool_call>。
-    1. 路径中的反斜杠必须写成 \\\\，例如 "E:\\\\geo-boot\\\\..."，绝对不能只写单个 \\。
-    2. 如果 JSON 字符串内需要包含双引号（例如 Java 代码、命令行参数），必须将内部的双引号写成 \\" 转义，或者改用单引号。
-       - 错误（Java 代码未转义）：{"content": "... @ApiModelProperty(value = "主键") ..."}
-       - 正确：{"content": "... @ApiModelProperty(value = \\"主键\\") ..."}
-       - 命令行错误：{"command": "echo "hello""}
-       - 命令行正确：{"command": "echo \\"hello\\""} 或 {"command": "echo 'hello'"}
-    3. 如果内容包含换行，必须使用 \\n 转义，绝对禁止输入真实换行符（按回车）。
-    4. JSON 不能有多余逗号，不能换行，不能缩进，必须紧凑在一行。
-    5. 不要输出任何解释、道歉、感叹词，只输出这一行调用。
-  - 再次强调正确示例：
-    <tool_call name="save_note">{"title": "笔记", "body": "第一行\\n第二行，引用\\"内容\\"结束"}</tool_call>
+          const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n`  +
+            `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
+            `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
+  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，然后直到下一个 “======” 或结束的所有行都是参数值。
+  - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
+  - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
+  - 每个 <tool_call> 必须用 </tool_call> 闭合
+  - 绝对禁止使用 <parameter> 标签！不要使用 <parameter name="xxx">value</parameter> 这种格式！
+  - 正确示例：
+    <tool_call name="read">
+    ======
+    filePath
+    ++++++
+    E:\data\test.xml
+    ======
+    offset
+    ++++++
+    10
+    ======
+    </tool_call>
+    <tool_call name="write">
+    ======
+    filePath
+    ++++++
+    E:\data\Demo.java
+    ======
+    content
+    ++++++
+    public class Demo {
+        private String name = "示例";
+    }
+    ======
+    </tool_call>
+  - 错误示例（禁止）：
+    <tool_call name="read">
+    <parameter name="filePath">E:\data\test.xml</parameter>
+    </tool_call>
   如果任务已完成，请输出“任务已完成”。`;
-
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -732,24 +715,39 @@ async function main() {
             const cleaned = cleanTaskCompletedMark(rawOutput);
             if (cleaned) {
               console.log('[ToolCall] 格式纠正时返回任务完成标记，清洗后返回');
+              cleaned = cleaned
+                .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
+                .replace(/(复制|下载|运行|调试|代码)/g, '');
               return { toolCall: null, toolCalls: [], rawOutput: cleaned };
             } else {
               const fallback = cleanTaskCompletedMark(firstOutput) || '';
               console.log('[ToolCall] 格式纠正时仅返回“任务已完成”，回退到首次正常输出');
+              fallback = fallback
+                .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
+                .replace(/(复制|下载|运行|调试|代码)/g, '');
               return { toolCall: null, toolCalls: [], rawOutput: fallback };
             }
           }
 
           parseResult = parseToolCall(rawOutput, toolNames);
           if (!parseResult.found) {
-            console.log('[ToolCall] 模型仍未输出工具调用，继续要求...');
-            parseResult = { found: false, success: false, error: '仍未看到工具调用，必须输出 <tool_call name="...">...</tool_call>' };
-            // return { toolCall: null, toolCalls: [], rawOutput: cleanedOutput.trim() || rawOutput };
+            // 模型拒绝输出工具调用，将当前文本作为最终回复返回
+            console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
+            let finalText = rawOutput
+              .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
+              .replace(/(复制|下载|运行|调试|代码)/g, '')
+              .replace(/任务已完成[。！？.!?\s]*/g, '')
+              .trim();
+            return { toolCall: null, toolCalls: [], rawOutput: finalText || rawOutput };
           }
         }
       } else {
         // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
-        const cleaned = cleanTaskCompletedMark(rawOutput);
+        // 清洗 UI 杂讯，仅在纯文本模式下进行
+        let cleanText = rawOutput
+          .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
+          .replace(/(复制|下载|运行|调试|代码)/g, '');
+        const cleaned = cleanTaskCompletedMark(cleanText);
         return { toolCall: null, rawOutput: cleaned || rawOutput };
       }
     }
@@ -825,7 +823,13 @@ async function main() {
             const recentMessages = messages.slice(-MAX_HISTORY);
             let promptText = "";
             for (const msg of recentMessages) {
-              const rawContent = extractTextContent(msg.content);
+              let rawContent = extractTextContent(msg.content);
+              // 只清洗 assistant 消息中的 UI 杂讯，保护工具返回的原始文件内容
+              if (msg.role === 'assistant') {
+                  rawContent = rawContent
+                      .replace(/(复制|下载|运行|调试|代码)/g, '')
+                      .replace(/任务已完成[。！？.!?\s]*/g, '');  // 增加此行，清除历史中的“任务已完成”
+              }
               const content = rawContent.slice(0, 2000);
               if (msg.role === 'system') {
                 promptText += `【系统提示】\n${content}`;
@@ -844,44 +848,60 @@ async function main() {
             const toolsText = tools.length > 0
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
-                        const toolCallInstructions = tools.length > 0
+            const toolCallInstructions = tools.length > 0
   ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
-  - 当你需要调用工具时，可以输出一个或多个 <tool_call> 块，每个块一行，不能有其他文字。
-  - 格式：<tool_call name="函数名">参数JSON</tool_call>
-  - name 必须与可用函数名完全一致。
-  - 参数JSON对象必须合法、紧凑、单行，并严格遵守JSON转义规范：
-    1. 所有字符串用英文双引号包裹，内部的英文双引号必须用反斜杠转义，如 \\"text\\"。
-    2. 任何字符串值中如果含有换行，必须使用 \\n 转义，绝对、绝对不要输入真实的换行符。
-    3. 不能有多余逗号（如末尾逗号）。
-    4. 整个JSON必须在一行内，不允许换行，不允许缩进。
-    5. 如果字符串值中包含反斜杠（例如 Windows 路径），必须写成 \\\\，例如 "E:\\\\abc\\\\..."。
-  - 正确示例（注意双引号转义）：
-    <tool_call name="send_message">{"content": "他说：\\"你好，世界\\"\\n第二行内容"}</tool_call>
-  - 正确示例（多参数无特殊字符）：
-    <tool_call name="search">{"query": "今天天气", "limit": 5}</tool_call>
-  - 特别注意：如果你的 old_str、new_str、content 等参数包含 XML 或 HTML 标签，其中的属性必须转义双引号。
-  - 如果你的 content 参数包含 Java 代码或任何含双引号的文本，请务必将代码中的每一个双引号都写成 \\" 转义，否则 JSON 无法解析。
-    错误：{"oldString": "<result property="createTime" />"}
-    正确：{"oldString": "<result property=\\"createTime\\" />"}
-  - 多工具正确示例：
-    <tool_call name="glob">{"path": "E:\\\\project", "pattern": "**/*.java"}</tool_call>
-    <tool_call name="read">{"filePath": "E:\\\\project\\\\Main.java", "offset": 1, "limit": 50}</tool_call>
-
+  - 每个 <tool_call> 必须用 </tool_call> 闭合
+  - 每个 <tool_call> 块使用以下格式传递参数，完全不需要任何转义：
+    <tool_call name="函数名">
+    ======
+    参数名
+    ++++++
+    参数值（可以包含多行、双引号、反斜杠等）
+    ======
+    ...
+    </tool_call>
+  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，之后直到下一个 “======” 之前的所有行都是该参数的值（可包含任意字符）。
+  - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
+  - 简单参数示例：
+    <tool_call name="read">
+    ======
+    filePath
+    ++++++
+    E:\kytion-boot\video\src\main\resources\mapper\matrix\UserImsIceMapper.xml
+    ======
+    offset
+    ++++++
+    10
+    ======
+    limit
+    ++++++
+    20
+    ======
+    </tool_call>
+  - 多行/复杂内容示例：
+    <tool_call name="write">
+    ======
+    filePath
+    ++++++
+    E:\project\Demo.java
+    ======
+    content
+    ++++++
+    public class Demo {
+        private String name = "示例";
+    }
+    ======
+    </tool_call>
+  - 可同时输出多个 <tool_call> 块。
+  【注意】：参数值中请勿包含独占一行的 “======” 或 “++++++”，否则会导致解析错误。如果必须包含，请用 Base64 编码等替代方式。
   【执行修改后必须验证】
   - 如果你调用了任何修改文件系统、数据库或配置的工具（如 write_file, replace_content, execute_command 等），在收到工具执行结果后，你必须紧接着调用读取或检查工具来验证修改是否成功。
   - 验证成功后，你可以输出简短的确认信息（如“文件已成功修改”）；如果验证失败，必须报告具体错误。
-  - 示例流程（修改文件后读取验证）：
-    <tool_call name="replace_content">{"filePath": "E:\\\\project\\\\App.java", "old_str": "...", "new_str": "..."}</tool_call>
-    <tool_call name="read">{"filePath": "E:\\\\project\\\\App.java", "offset": 1, "limit": 30}</tool_call>
-
-  【绝对禁止的格式（会导致严重错误）】
-  1. 禁止使用 <tool_calls>、<invoke>、<parameter>、<function_call> 等任何其他标签，只能使用 <tool_call>。
-  2. 禁止在标签内使用 XML 属性（如 string="true"），参数必须全部写在 JSON 对象中。
-  3. JSON 内部禁止出现真实换行。
-  4. 标签外禁止附加任何解释、道歉或描述。
-  5. 禁止使用旧格式 <tool_call>{"name":"xx","arguments":{}}</tool_call>。
-
-  如果不需要使用工具，直接输出文本回复。`
+  【绝对禁止的格式】
+  1. 禁止使用 JSON 格式。
+  2. 禁止使用 <parameter> 标签传递参数，必须使用 ======/++++++ 分隔。
+  3. 禁止使用 <tool_calls> 等其他标签。
+  如果不需要工具，直接回复文本。`
   : '';
 
             const { toolCall, toolCalls, rawOutput } = await getFinalReplyWithTools(
