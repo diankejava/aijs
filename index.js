@@ -177,76 +177,24 @@ async function main() {
           console.log('\x1b[35m[DEBUG] 检测到完成信号，等待内容稳定...\x1b[0m');
           await page.waitForTimeout(300);
           let reply = await page.evaluate(() => {
-              // 递归遍历 DOM，在块级元素和 <br> 后自动插入换行
-              function extractTextWithLineBreaks(el) {
-                  if (!el) return '';
-                  let text = '';
-                  for (const node of el.childNodes) {
-                      if (node.nodeType === Node.TEXT_NODE) {
-                          text += node.textContent;
-                      } else if (node.nodeType === Node.ELEMENT_NODE) {
-                          const tag = node.tagName.toLowerCase();
-                          if (tag === 'br') {
-                              text += '\n';
-                              continue;
-                          }
-                          const innerText = extractTextWithLineBreaks(node);
-                          const blockTags = ['p','div','h1','h2','h3','h4','h5','h6','li','section','article','header','footer'];
-                          if (blockTags.includes(tag)) {
-                              text += innerText + '\n';
-                          } else {
-                              text += innerText;
-                          }
-                      }
-                  }
-                  return text;
-              }
-
               const items = document.querySelectorAll('[data-virtual-list-item-key]');
               if (!items.length) return '';
               const last = items[items.length - 1];
               const main = last.querySelector('.ds-assistant-message-main-content');
               if (!main) return '';
-
-              let text = extractTextWithLineBreaks(main).trim();
-              // 清洗操作已移至 getFinalReplyWithTools，此处只返回原始文本
-              return text;
+              // 使用 innerText 完美保留所有视觉换行
+              return main.innerText.trim();
           });
 
           if (!reply) {
             await page.waitForTimeout(500);
             reply = await page.evaluate(() => {
-              function extractTextWithLineBreaks(el) {
-                  if (!el) return '';
-                  let text = '';
-                  for (const node of el.childNodes) {
-                      if (node.nodeType === Node.TEXT_NODE) {
-                          text += node.textContent;
-                      } else if (node.nodeType === Node.ELEMENT_NODE) {
-                          const tag = node.tagName.toLowerCase();
-                          if (tag === 'br') {
-                              text += '\n';
-                              continue;
-                          }
-                          const innerText = extractTextWithLineBreaks(node);
-                          const blockTags = ['p','div','h1','h2','h3','h4','h5','h6','li','section','article','header','footer'];
-                          if (blockTags.includes(tag)) {
-                              text += innerText + '\n';
-                          } else {
-                              text += innerText;
-                          }
-                      }
-                  }
-                  return text;
-              }
-
               const items = document.querySelectorAll('[data-virtual-list-item-key]');
               if (!items.length) return '';
               const last = items[items.length - 1];
               const main = last.querySelector('.ds-assistant-message-main-content');
               if (!main) return '';
-              let text = extractTextWithLineBreaks(main).trim();
-              // 清洗操作已移至 getFinalReplyWithTools
+              let text = main.innerText.trim();
               if (text.includes('User:') || text.includes('Assistant:')) return '';
               return text;
             });
@@ -503,15 +451,15 @@ async function main() {
 
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
-          // 判断当前行是否以 = 开头（至少一个），视为参数分隔行，忽略其后内容
-          if (/^=+/.test(line.trim())) {
+          // 判断当前行（去除空白后）是否包含连续至少5个 =，视为参数分隔行
+          if (/={5,}/.test(line.trim())) {
             flush();
             continue;
           }
-          // 判断当前行是否以 + 开头（至少一个），视为键值分隔行，忽略其后内容
-          if (/^\++/.test(line.trim())) {
+          // 判断当前行（去除空白后）是否包含连续至少5个 +，视为键值分隔行
+          if (/\+{5,}/.test(line.trim())) {
             if (currentKey) {
-              continue; // 加号行本身不存储，直接跳过
+              continue;
             }
             continue;
           }
@@ -551,19 +499,11 @@ async function main() {
           continue;
         }
 
-        // 预处理分隔符（自动补换行）：保证每个 = 或 + 块前后有换行，数量不限
-        let fixedArgs = rawArgs
-          .replace(/([^\n])(=+)([^\n])/g, '$1\n$2\n$3')
-          .replace(/([^\n])(=+)$/gm, '$1\n$2')
-          .replace(/^(=+)([^\n])/gm, '$1\n$2')
-          .replace(/([^\n])(\++)([^\n])/g, '$1\n$2\n$3')
-          .replace(/([^\n])(\++)$/gm, '$1\n$2')
-          .replace(/^(\++)([^\n])/gm, '$1\n$2');
-        // 确保首尾有换行
-        fixedArgs = '\n' + fixedArgs + '\n';
-
+        // 直接使用原始参数文本，仅确保首尾有换行（innerText 已提供正确换行）
+        let fixedArgs = '\n' + rawArgs.trim() + '\n';
         const parsedArgs = parseKeyValueArgs(fixedArgs);
         if (!parsedArgs) {
+          console.log('[ToolCall] 失败的参数文本：', rawArgs);
           results.push({ success: false, error: `参数格式错误，请使用 ====== / ++++++ 分隔格式，失败的参数文本：${rawArgs.slice(0, 100)}` });
         } else {
           // 额外校验：只保留合法的参数名，并丢弃完全无效的键
@@ -733,10 +673,14 @@ async function main() {
           if (!parseResult.found) {
             // 模型拒绝输出工具调用，将当前文本作为最终回复返回
             console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
+            const langKeywords = /^(java|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
             let finalText = rawOutput
               .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
               .replace(/(复制|下载|运行|调试|代码)/g, '')
               .replace(/任务已完成[。！？.!?\s]*/g, '')
+              .split('\n')
+              .filter(line => !langKeywords.test(line.trim()))
+              .join('\n')
               .trim();
             return { toolCall: null, toolCalls: [], rawOutput: finalText || rawOutput };
           }
@@ -744,9 +688,13 @@ async function main() {
       } else {
         // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
         // 清洗 UI 杂讯，仅在纯文本模式下进行
+        const langKeywords = /^(java|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
         let cleanText = rawOutput
           .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-          .replace(/(复制|下载|运行|调试|代码)/g, '');
+          .replace(/(复制|下载|运行|调试|代码)/g, '')
+          .split('\n')
+          .filter(line => !langKeywords.test(line.trim()))
+          .join('\n');
         const cleaned = cleanTaskCompletedMark(cleanText);
         return { toolCall: null, rawOutput: cleaned || rawOutput };
       }
