@@ -674,7 +674,7 @@ async function main() {
           if (!parseResult.found) {
             // 模型拒绝输出工具调用，将当前文本作为最终回复返回
             console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
-            const langKeywords = /^(java|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
+            const langKeywords = /^(java|text|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
             let finalText = rawOutput
               .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
               .replace(/(复制|下载|运行|调试|代码)/g, '')
@@ -689,7 +689,7 @@ async function main() {
       } else {
         // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
         // 清洗 UI 杂讯，仅在纯文本模式下进行
-        const langKeywords = /^(java|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
+        const langKeywords = /^(java|text|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
         let cleanText = rawOutput
           .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
           .replace(/(复制|下载|运行|调试|代码)/g, '')
