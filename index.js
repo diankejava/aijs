@@ -612,6 +612,7 @@ async function main() {
   - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
   - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
   - 每个 <tool_call> 必须用 </tool_call> 闭合
+  - 注意是tool_call不是tool_calls
   - 绝对禁止使用 <parameter> 标签！不要使用 <parameter name="xxx">value</parameter> 这种格式！
   - 正确示例：
     <tool_call name="read">
@@ -799,6 +800,7 @@ async function main() {
             const toolCallInstructions = tools.length > 0
   ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
   - 每个 <tool_call> 必须用 </tool_call> 闭合
+  - 注意是tool_call，不是tool_calls
   - 每个 <tool_call> 块使用以下格式传递参数，完全不需要任何转义：
     <tool_call name="函数名">
     ======
