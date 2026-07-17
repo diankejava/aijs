@@ -639,9 +639,27 @@ async function main() {
     }
     ======
     </tool_call>
-  - 错误示例（禁止）：
     <tool_call name="read">
-    <parameter name="filePath">E:\data\test.xml</parameter>
+    ======
+    filePath
+    ++++++
+    E:data	est.xml
+    ======
+    offset
+    ++++++
+    10
+    ======
+    </tool_call>
+    <tool_call name="read">
+    ======
+    filePath
+    ++++++
+    E:data	est.xml
+    ======
+    offset
+    ++++++
+    10
+    ======
     </tool_call>
   如果任务已完成，请输出“任务已完成”。`;
           reply = await sendAndWait(retryPrompt, cancelState);
