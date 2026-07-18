@@ -661,7 +661,9 @@ async function main() {
     10
     ======
     </tool_call>
-  如果任务已完成，请输出“任务已完成”。`;
+  如果任务已完成，请输出“任务已完成”。
+  【缩进规则】
+  edit/write 工具修改文件时，必须保持与目标文件完全一致的缩进风格。绝不允许生成顶格代码替换原本有缩进的代码。`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -869,8 +871,14 @@ async function main() {
   1. 禁止使用 JSON 格式。
   2. 禁止使用 <parameter> 标签传递参数，必须使用 ======/++++++ 分隔。
   3. 禁止使用 <tool_calls> 等其他标签。
-  如果不需要工具，直接回复文本。`
-  : '';
+如果不需要工具，直接回复文本。
+【缩进规则 - 必须严格遵守】
+使用 edit/write 工具修改文件时，必须保持与目标文件完全一致的缩进风格（空格/Tab、缩进宽度）
+构造 oldString 时，必须从目标文件原样复制足够多的上下文行（至少包含前后各 2-3 行），以便准确判断缩进模式
+构造 newString 时，缩进必须与 oldString 在目标文件中的缩进层级完全匹配
+如果目标文件使用 2 空格缩进，newString 也必须使用 2 空格缩进；如果使用 Tab，也必须用 Tab
+绝不允许生成顶格（无缩进）的代码来替换原本有缩进的代码`
+: '';
 
             const { toolCall, toolCalls, rawOutput } = await getFinalReplyWithTools(
               promptText, toolsText, toolCallInstructions,toolNames,cancelState
