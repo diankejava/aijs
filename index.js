@@ -84,7 +84,7 @@ async function main() {
         loggedIn = true;
         break;
       }
-    } catch (_) {}
+    } catch (_) { }
   }
 
   if (loggedIn) {
@@ -109,7 +109,7 @@ async function main() {
       } catch (e) {
         if (e.message && e.message.includes('Execution context')) {
           console.log('  检测到页面跳转，等待稳定后重试...');
-          try { await page.waitForLoadState('domcontentloaded', { timeout: 15000 }); } catch (_) {}
+          try { await page.waitForLoadState('domcontentloaded', { timeout: 15000 }); } catch (_) { }
         } else {
           throw e;
         }
@@ -155,148 +155,152 @@ async function main() {
       if (el && await el.isVisible()) return el;
     }
     return null;
-}
+  }
 
-// 检测重试按钮（中英文 + CSS 类名）
-async function detectRetryButton() {
-const retryPatterns = ['Retry', 'Refresh', 'refresh', 'retry'];
-try {
-const buttons = page.locator('button, [role="button"]');
-const count = await buttons.count();
-for (let i = 0; i < count; i++) {
-const btn = buttons.nth(i);
-try {
-const text = await btn.innerText({ timeout: 2000 });
-for (const pattern of retryPatterns) {
-if (text.includes(pattern)) {
-const visible = await btn.isVisible({ timeout: 2000 });
-if (visible) {
-console.log('[重试检测] 发现重试按钮: "' + text.trim() + '"');
-return btn;
-}
-}
-}
-} catch (e) {}
-}
-} catch (e) {}
-try {
-const warningBtns = page.locator('[role="button"].ds-button--warning, button.ds-button--warning');
-if (await warningBtns.count() > 0) {
-const btn = warningBtns.first();
-if (await btn.isVisible({ timeout: 2000 })) {
-console.log('[重试检测] 发现重试/警告按钮（CSS类名）');
-return btn;
-}
-}
-} catch (e) {}
-return null;
-}
+  // 检测重试按钮（中英文 + CSS 类名）
+  async function detectRetryButton() {
+    const retryPatterns = ['Retry', 'Refresh', 'refresh', 'retry'];
+    try {
+      const buttons = page.locator('button, [role="button"]');
+      const count = await buttons.count();
+      for (let i = 0; i < count; i++) {
+        const btn = buttons.nth(i);
+        try {
+          const text = await btn.innerText({ timeout: 2000 });
+          for (const pattern of retryPatterns) {
+            if (text.includes(pattern)) {
+              const visible = await btn.isVisible({ timeout: 2000 });
+              if (visible) {
+                console.log('[重试检测] 发现重试按钮: "' + text.trim() + '"');
+                return btn;
+              }
+            }
+          }
+        } catch (e) { }
+      }
+    } catch (e) { }
+    try {
+      const warningBtns = page.locator('[role="button"].ds-button--warning, button.ds-button--warning');
+      if (await warningBtns.count() > 0) {
+        const btn = warningBtns.first();
+        if (await btn.isVisible({ timeout: 2000 })) {
+          console.log('[重试检测] 发现重试/警告按钮（CSS类名）');
+          return btn;
+        }
+      }
+    } catch (e) { }
+    return null;
+  }
 
-// 检测错误文本（仅完整短语，避免误判）
-async function detectErrorText() {
-const errorPatterns = [
-'Something went wrong', 'An error occurred',
-'failed to generate', 'response was cut off', 'timed out',
-'Server busy', 'please try again', 'unavailable'
-];
-try {
-const bodyText = await page.locator('body').innerText({ timeout: 3000 });
-for (const pattern of errorPatterns) {
-if (bodyText.includes(pattern)) {
-console.log('[重试检测] 发现错误提示: "' + pattern + '"');
-return true;
-}
-}
-} catch (e) {}
-return false;
-}
+  // 检测错误文本（仅完整短语，避免误判）
+  async function detectErrorText() {
+    const errorPatterns = [
+      'Something went wrong', 'An error occurred',
+      'failed to generate', 'response was cut off', 'timed out',
+      'Server busy', 'please try again', 'unavailable'
+    ];
+    try {
+      const bodyText = await page.locator('body').innerText({ timeout: 3000 });
+      for (const pattern of errorPatterns) {
+        if (bodyText.includes(pattern)) {
+          console.log('[重试检测] 发现错误提示: "' + pattern + '"');
+          return true;
+        }
+      }
+    } catch (e) { }
+    return false;
+  }
 
-// 带重试检测的 waitForReply（已验证有效）
-async function waitForReply(timeout = 300000) {
-console.log('[DEBUG] 等待 AI 回复（支持重试检测）...');
-const startTime = Date.now();
-let lastRetryCheck = 0;
+  // 带重试检测的 waitForReply（已验证有效）
+  async function waitForReply(timeout = 300000) {
+    console.log('[DEBUG] 等待 AI 回复（支持重试检测）...');
+    const startTime = Date.now();
+    let lastRetryCheck = 0;
 
-while (Date.now() - startTime < timeout) {
-try {
-// 每 3 秒检查一次重试/错误
-if (Date.now() - lastRetryCheck > 3000) {
-lastRetryCheck = Date.now();
+    while (Date.now() - startTime < timeout) {
+        try {
+            // ===== 1. 优先检查是否已有完整回复（无论页面是否显示错误） =====
+            const found = await page.evaluate(() => {
+                const items = document.querySelectorAll('[data-virtual-list-item-key]');
+                if (!items.length) return false;
+                const last = items[items.length - 1];
+                return !!(last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex'));
+            });
 
-const retryBtn = await detectRetryButton();
-if (retryBtn) {
-console.log('[重试] 检测到重试按钮，自动点击...');
-try {
-await retryBtn.click();
-console.log('[重试] 已点击重试按钮，继续等待...');
-} catch (e) {
-console.log('[重试] 点击重试按钮失败:', e.message);
-}
-await page.waitForTimeout(1000);
-continue;
-}
+            if (found) {
+                console.log('[DEBUG] 检测到完成信号，提取回复...');
+                await page.waitForTimeout(300);
 
-const hasError = await detectErrorText();
-if (hasError) {
-console.log('[重试] 检测到错误提示，等待页面恢复...');
-await page.waitForTimeout(3000);
-continue;
-}
-}
+                let reply = await page.evaluate(() => {
+                    const items = document.querySelectorAll('[data-virtual-list-item-key]');
+                    if (!items.length) return '';
+                    const last = items[items.length - 1];
+                    const main = last.querySelector('.ds-assistant-message-main-content');
+                    return main ? main.innerText.trim() : '';
+                });
 
-// 检测完成信号
-const found = await page.evaluate(() => {
-const items = document.querySelectorAll('[data-virtual-list-item-key]');
-if (!items.length) return false;
-const last = items[items.length - 1];
-return !!(last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex'));
-});
+                if (!reply) {
+                    await page.waitForTimeout(500);
+                    reply = await page.evaluate(() => {
+                        const items = document.querySelectorAll('[data-virtual-list-item-key]');
+                        if (!items.length) return '';
+                        const last = items[items.length - 1];
+                        const main = last.querySelector('.ds-assistant-message-main-content');
+                        if (!main) return '';
+                        let text = main.innerText.trim();
+                        if (text.includes('User:') || text.includes('Assistant:')) return '';
+                        return text;
+                    });
+                }
 
-if (found) {
-console.log('[DEBUG] 检测到完成信号，提取回复...');
-await page.waitForTimeout(300);
+                console.log('[DEBUG] 成功提取回复，长度:', reply ? reply.length : 0);
+                return reply || '';
+            }
 
-let reply = await page.evaluate(() => {
-const items = document.querySelectorAll('[data-virtual-list-item-key]');
-if (!items.length) return '';
-const last = items[items.length - 1];
-const main = last.querySelector('.ds-assistant-message-main-content');
-if (!main) return '';
-return main.innerText.trim();
-});
+            // ===== 2. 没有完成信号时才进行重试/错误处理（降低检查频率） =====
+            if (Date.now() - lastRetryCheck > 3000) {
+                lastRetryCheck = Date.now();
 
-if (!reply) {
-await page.waitForTimeout(500);
-reply = await page.evaluate(() => {
-const items = document.querySelectorAll('[data-virtual-list-item-key]');
-if (!items.length) return '';
-const last = items[items.length - 1];
-const main = last.querySelector('.ds-assistant-message-main-content');
-if (!main) return '';
-let text = main.innerText.trim();
-if (text.includes('User:') || text.includes('Assistant:')) return '';
-return text;
-});
-}
+                const retryBtn = await detectRetryButton();
+                if (retryBtn) {
+                    console.log('[重试] 检测到重试按钮，自动点击...');
+                    try {
+                        await retryBtn.click();
+                        console.log('[重试] 已点击重试按钮，继续等待...');
+                    } catch (e) {
+                        console.log('[重试] 点击重试按钮失败:', e.message);
+                    }
+                    await page.waitForTimeout(1000);
+                    continue;
+                }
 
-console.log('[DEBUG] 成功提取回复，长度:', reply ? reply.length : 0);
-return reply || '';
-}
-} catch (e) {
-if (e.message && e.message.includes('Execution context')) {
-console.log('[DEBUG] 页面上下文失效，等待稳定...');
-await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-} else {
-console.log('[DEBUG] 轮询异常:', e.message);
-}
-}
+                const hasError = await detectErrorText();
+                if (hasError) {
+                    // 仅记录，不进行长时间等待，立即回到循环开头重新检查完成信号
+                    console.log('[重试] 检测到错误提示，继续等待模型回复...');
+                    // 极短延迟避免高频轮询，但很快再次检查
+                    await page.waitForTimeout(500);
+                    continue;
+                }
+            }
 
-await page.waitForTimeout(1000);
-}
+            // ===== 3. 正常轮询间隔 =====
+            await page.waitForTimeout(1000);
 
-console.log('[DEBUG] waitForReply 超时');
-return null;
-}
+        } catch (e) {
+            if (e.message && e.message.includes('Execution context')) {
+                console.log('[DEBUG] 页面上下文失效，等待稳定...');
+                await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+            } else {
+                console.log('[DEBUG] 轮询异常:', e.message);
+            }
+            await page.waitForTimeout(1000);
+        }
+    }
+
+    console.log('[DEBUG] waitForReply 超时');
+    return null;
+  }
 
   async function sendAndWait(text, cancelState = null) {
     console.log('\x1b[36m[DEBUG] === 发送消息 ===\x1b[0m');
@@ -437,20 +441,20 @@ return null;
 
     // 通过页面上下文检测超限提示（不依赖类名）
     const isOverLimit = await page.evaluate(() => {
-        const spans = document.querySelectorAll('span');
-        const regex = /(over limit|超出限制|超过限制|超出).*?\d+%/i;
-        for (const span of spans) {
-            const text = span.textContent.trim();
-            if (regex.test(text) && span.offsetParent !== null) {
-                return text;
-            }
+      const spans = document.querySelectorAll('span');
+      const regex = /(over limit|超出限制|超过限制|超出).*?\d+%/i;
+      for (const span of spans) {
+        const text = span.textContent.trim();
+        if (regex.test(text) && span.offsetParent !== null) {
+          return text;
         }
-        return null;
+      }
+      return null;
     });
 
     if (isOverLimit) {
-        console.log(`\x1b[31m[ERROR] 检测到上下文超限: ${isOverLimit}\x1b[0m`);
-        return null;
+      console.log(`\x1b[31m[ERROR] 检测到上下文超限: ${isOverLimit}\x1b[0m`);
+      return null;
     }
 
     console.log('\x1b[35m[DEBUG] 进入 waitForReply\x1b[0m');
@@ -612,7 +616,7 @@ return null;
           return { found: true, success: false, toolCalls: [], toolCall: null, error: '检测到禁止的标签格式，必须使用 <tool_call name="函数名">====== ... ++++++ ... </tool_call>' };
         }
         if (text.includes('<tool_call') || text.includes('&lt;tool_call')) {
-           return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <tool_call> 标签但无法解析，必须使用 ====== / ++++++ 分隔参数' };
+          return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <tool_call> 标签但无法解析，必须使用 ====== / ++++++ 分隔参数' };
         }
         return { found: false, success: false, toolCalls: [], toolCall: null };
       }
@@ -658,14 +662,14 @@ return null;
           if (parseResult.success) {
             // 提取工具调用标签之外的纯文本作为助手文字说明
             const textContent = rawOutput
-                .replace(/<tool_call[\s\S]*?<\/tool_call>/g, '')  // 移除所有 tool_call 块
-                .replace(/\n{3,}/g, '\n\n')                         // 压缩多余空行
-                .trim();
-            return { 
-                toolCall: parseResult.toolCall, 
-                toolCalls: parseResult.toolCalls, 
-                rawOutput,
-                assistantContent: textContent || null               // 为空则返回 null
+              .replace(/<tool_call[\s\S]*?<\/tool_call>/g, '')  // 移除所有 tool_call 块
+              .replace(/\n{3,}/g, '\n\n')                         // 压缩多余空行
+              .trim();
+            return {
+              toolCall: parseResult.toolCall,
+              toolCalls: parseResult.toolCalls,
+              rawOutput,
+              assistantContent: textContent || null               // 为空则返回 null
             };
           }
           console.log('[ToolCall] 格式错误，继续纠正...');
@@ -675,7 +679,7 @@ return null;
             const failedText = failedMatch[1].trim();
             fixExample = `\n  【你的错误输出】：${failedText.slice(0, 200)}`;
           }
-          const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n`  +
+          const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n` +
             `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
             `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
   - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，然后直到下一个 “======” 或结束的所有行都是参数值。
@@ -824,7 +828,7 @@ return null;
               res.end(JSON.stringify({ error: { message: 'No message content', type: 'invalid_request_error' } }));
               return;
             }
-            
+
             // 防重放过滤器（保留）
             // if (userMsg.includes('User:') || userMsg.includes('Assistant:')) {
             //   console.log('\x1b[31m[网关拦截] 检测到回流的对话历史，已拒绝:\x1b[0m', userMsg.slice(0, 80));
@@ -845,8 +849,8 @@ return null;
               let rawContent = extractTextContent(msg.content);
               // 只清洗 assistant 消息中的 UI 杂讯，保护工具返回的原始文件内容
               if (msg.role === 'assistant') {
-                  rawContent = rawContent
-                      .replace(/(复制|下载|运行|调试|代码)/g, '');
+                rawContent = rawContent
+                  .replace(/(复制|下载|运行|调试|代码)/g, '');
               }
               const content = rawContent.slice(0, 2000);
               if (msg.role === 'system') {
@@ -867,7 +871,7 @@ return null;
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
             const toolCallInstructions = tools.length > 0
-  ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
+              ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
   - 每个 <tool_call> 必须用 </tool_call> 闭合
   - 注意是tool_call，不是tool_calls
   - 每个 <tool_call> 块使用以下格式传递参数，完全不需要任何转义：
@@ -927,10 +931,10 @@ return null;
 构造 newString 时，缩进必须与 oldString 在目标文件中的缩进层级完全匹配
 如果目标文件使用 2 空格缩进，newString 也必须使用 2 空格缩进；如果使用 Tab，也必须用 Tab
 绝不允许生成顶格（无缩进）的代码来替换原本有缩进的代码`
-: '';
+              : '';
 
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
-              promptText, toolsText, toolCallInstructions,toolNames,cancelState
+              promptText, toolsText, toolCallInstructions, toolNames, cancelState
             );
 
             const hasTool = toolCalls && toolCalls.length > 0;
@@ -1037,22 +1041,22 @@ return null;
               if (hasTool) {
                 // ★ 先流式发送文字说明（如果存在）
                 if (assistantContent) {
-                    for (const char of assistantContent) {
-                        if (responseEnded || !res.writable) break;
-                        const chunk = {
-                            id: chunkId,
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: model,
-                            choices: [{
-                                index: 0,
-                                delta: { content: char },
-                                finish_reason: null
-                            }]
-                        };
-                        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                        await new Promise(r => setTimeout(r, 20));
-                    }
+                  for (const char of assistantContent) {
+                    if (responseEnded || !res.writable) break;
+                    const chunk = {
+                      id: chunkId,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: model,
+                      choices: [{
+                        index: 0,
+                        delta: { content: char },
+                        finish_reason: null
+                      }]
+                    };
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                    await new Promise(r => setTimeout(r, 20));
+                  }
                 }
 
                 // 2. 工具调用流式发送（支持多个）
@@ -1181,7 +1185,7 @@ return null;
               return;
             }
 
-                        // ---- 非流式响应 ----
+            // ---- 非流式响应 ----
             const response = {
               id: 'chatcmpl-' + Date.now(),
               object: 'chat.completion',
@@ -1277,7 +1281,7 @@ return null;
       try {
         const state = await browser.storageState();
         fs.writeFileSync(storageStateFile, JSON.stringify(state, null, 2));
-      } catch (_) {}
+      } catch (_) { }
       server.close();
       await browser.close();
       process.exit(0);
@@ -1309,7 +1313,7 @@ return null;
     try {
       const state = await browser.storageState();
       fs.writeFileSync(storageStateFile, JSON.stringify(state, null, 2));
-    } catch (_) {}
+    } catch (_) { }
     server.close();
     await browser.close();
     process.exit(0);
