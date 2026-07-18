@@ -552,14 +552,13 @@ async function main() {
     }
 
     /**
-     * 清洗回复中的“任务已完成”标记，保留正常文本
-     * @param {string} text - 可能包含“任务已完成”的原始文本
+     * @param {string} text
      * @returns {string|null} 清洗后的有效文本，若为空则返回 null
      */
     function cleanTaskCompletedMark(text) {
       if (!text) return null;
-      // 移除“任务已完成”及其后的可选标点，同时去除首尾空白
-      const cleaned = text.replace(/任务已完成[。！？.!?\s]*/g, '').trim();
+      // 去除首尾空白
+      const cleaned = text.trim();
       return cleaned.length > 0 ? cleaned : null;
     }
 
@@ -570,24 +569,6 @@ async function main() {
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
       const firstOutput = rawOutput; // 保存模型第一次的原始回答，作为回退使用
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
-
-      // ----- 如果首次输出中就包含“任务已完成”，清洗后再决定是否立即结束 -----
-      const cleanedFirst = cleanTaskCompletedMark(rawOutput);
-      if (rawOutput.includes('任务已完成')) {
-        if (cleanedFirst) {
-          // 如果清洗后仍有有效内容，直接返回给客户端（不再继续工具流程）
-          console.log('[ToolCall] 首次回复即包含任务完成标记，清洗后返回有效内容');
-          let cleanedOutput = cleanedFirst
-            .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-            .replace(/(复制|下载|运行|调试|代码)/g, '');
-          return { toolCall: null, rawOutput: cleanedOutput };
-        } else {
-          // 清洗后为空，说明模型只说了“任务已完成”几个字，回退到 firstOutput（但 firstOutput 本身就只是这几个字）
-          // 此时没有更早的“正常输出”，只能返回一个空字符串或默认提示，这里返回空字符串让客户端自行处理
-          console.log('[ToolCall] 首次回复仅为“任务已完成”，无有效内容，返回空响应');
-          return { toolCall: null, rawOutput: '' };
-        }
-      }
 
       let parseResult = parseToolCall(rawOutput, toolNames);
 
@@ -661,7 +642,6 @@ async function main() {
     10
     ======
     </tool_call>
-  如果任务已完成，请输出“任务已完成”。
   【缩进规则】
   edit/write 工具修改文件时，必须保持与目标文件完全一致的缩进风格。绝不允许生成顶格代码替换原本有缩进的代码。`;
           reply = await sendAndWait(retryPrompt, cancelState);
@@ -672,24 +652,6 @@ async function main() {
           }
           console.log('[HTTP] 纠正后输出:', rawOutput);
 
-          if (rawOutput.includes('任务已完成')) {
-            const cleaned = cleanTaskCompletedMark(rawOutput);
-            if (cleaned) {
-              console.log('[ToolCall] 格式纠正时返回任务完成标记，清洗后返回');
-              cleaned = cleaned
-                .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-                .replace(/(复制|下载|运行|调试|代码)/g, '');
-              return { toolCall: null, toolCalls: [], rawOutput: cleaned };
-            } else {
-              const fallback = cleanTaskCompletedMark(firstOutput) || '';
-              console.log('[ToolCall] 格式纠正时仅返回“任务已完成”，回退到首次正常输出');
-              fallback = fallback
-                .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-                .replace(/(复制|下载|运行|调试|代码)/g, '');
-              return { toolCall: null, toolCalls: [], rawOutput: fallback };
-            }
-          }
-
           parseResult = parseToolCall(rawOutput, toolNames);
           if (!parseResult.found) {
             // 模型拒绝输出工具调用，将当前文本作为最终回复返回
@@ -698,7 +660,6 @@ async function main() {
             let finalText = rawOutput
               .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
               .replace(/(复制|下载|运行|调试|代码)/g, '')
-              .replace(/任务已完成[。！？.!?\s]*/g, '')
               .split('\n')
               .filter(line => !langKeywords.test(line.trim()))
               .join('\n')
@@ -796,8 +757,7 @@ async function main() {
               // 只清洗 assistant 消息中的 UI 杂讯，保护工具返回的原始文件内容
               if (msg.role === 'assistant') {
                   rawContent = rawContent
-                      .replace(/(复制|下载|运行|调试|代码)/g, '')
-                      .replace(/任务已完成[。！？.!?\s]*/g, '');  // 增加此行，清除历史中的“任务已完成”
+                      .replace(/(复制|下载|运行|调试|代码)/g, '');
               }
               const content = rawContent.slice(0, 2000);
               if (msg.role === 'system') {
