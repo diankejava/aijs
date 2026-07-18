@@ -574,10 +574,20 @@ async function main() {
 
       // 无论是否声明了工具，只要回复中包含了工具调用标签，就尝试解析或纠正
       if (parseResult.found) {
-        // 已发现工具调用标签，进行无限纠正直到解析成功或任务完成
+        // 已发现工具调用标签，进行无限纠正直到解析成功
         while (true) {
           if (parseResult.success) {
-            return { toolCall: parseResult.toolCall, toolCalls: parseResult.toolCalls, rawOutput };
+            // 提取工具调用标签之外的纯文本作为助手文字说明
+            const textContent = rawOutput
+                .replace(/<tool_call[\s\S]*?<\/tool_call>/g, '')  // 移除所有 tool_call 块
+                .replace(/\n{3,}/g, '\n\n')                         // 压缩多余空行
+                .trim();
+            return { 
+                toolCall: parseResult.toolCall, 
+                toolCalls: parseResult.toolCalls, 
+                rawOutput,
+                assistantContent: textContent || null               // 为空则返回 null
+            };
           }
           console.log('[ToolCall] 格式错误，继续纠正...');
           let fixExample = ''; // 必须初始化
@@ -600,7 +610,7 @@ async function main() {
     ======
     filePath
     ++++++
-    E:\data\test.xml
+    E:\\fata\\xest.xml
     ======
     offset
     ++++++
@@ -611,7 +621,7 @@ async function main() {
     ======
     filePath
     ++++++
-    E:\data\Demo.java
+    E:\\fata\\xest.xml
     ======
     content
     ++++++
@@ -624,7 +634,7 @@ async function main() {
     ======
     filePath
     ++++++
-    E:data	est.xml
+    E:\\fata\\xest.xml
     ======
     offset
     ++++++
@@ -635,7 +645,7 @@ async function main() {
     ======
     filePath
     ++++++
-    E:data	est.xml
+    E:\\fata\\xest.xml
     ======
     offset
     ++++++
@@ -664,7 +674,7 @@ async function main() {
               .filter(line => !langKeywords.test(line.trim()))
               .join('\n')
               .trim();
-            return { toolCall: null, toolCalls: [], rawOutput: finalText || rawOutput };
+            return { toolCall: null, toolCalls: [], rawOutput: finalText || rawOutput, assistantContent: null };
           }
         }
       } else {
@@ -678,7 +688,7 @@ async function main() {
           .filter(line => !langKeywords.test(line.trim()))
           .join('\n');
         const cleaned = cleanTaskCompletedMark(cleanText);
-        return { toolCall: null, rawOutput: cleaned || rawOutput };
+        return { toolCall: null, rawOutput: cleaned || rawOutput, assistantContent: null };
       }
     }
 
@@ -840,7 +850,7 @@ async function main() {
 绝不允许生成顶格（无缩进）的代码来替换原本有缩进的代码`
 : '';
 
-            const { toolCall, toolCalls, rawOutput } = await getFinalReplyWithTools(
+            const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
               promptText, toolsText, toolCallInstructions,toolNames,cancelState
             );
 
@@ -946,6 +956,26 @@ async function main() {
               }
 
               if (hasTool) {
+                // ★ 先流式发送文字说明（如果存在）
+                if (assistantContent) {
+                    for (const char of assistantContent) {
+                        if (responseEnded || !res.writable) break;
+                        const chunk = {
+                            id: chunkId,
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: model,
+                            choices: [{
+                                index: 0,
+                                delta: { content: char },
+                                finish_reason: null
+                            }]
+                        };
+                        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                        await new Promise(r => setTimeout(r, 20));
+                    }
+                }
+
                 // 2. 工具调用流式发送（支持多个）
                 for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
                   const tc = toolCalls[tcIdx];
@@ -1089,7 +1119,7 @@ async function main() {
             if (hasTool) {
               response.choices[0].message = {
                 role: 'assistant',
-                content: null,
+                content: assistantContent || null,
                 tool_calls: toolCalls.map(tc => ({
                   id: 'call_' + Math.random().toString(36).substr(2, 9),
                   type: 'function',
