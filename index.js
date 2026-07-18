@@ -74,7 +74,7 @@ async function main() {
   await page.goto(platform.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   console.log(`页面已打开，等待登录到 ${platform.name}...`);
 
-  const editorSelectors = platform.editor.split(', ');
+  const editorSelectors = platform.editor.split(',').map(s => s.trim());
   let loggedIn = false;
 
   for (const sel of editorSelectors) {
@@ -159,7 +159,7 @@ async function main() {
 
   // 检测重试按钮（中英文 + CSS 类名）
   async function detectRetryButton() {
-    const retryPatterns = ['Retry', 'Refresh', 'refresh', 'retry'];
+    const retryPatterns = ['重试', '重新生成', 'Retry', 'Refresh', 'refresh', 'retry'];
     try {
       const buttons = page.locator('button, [role="button"]');
       const count = await buttons.count();
@@ -392,7 +392,7 @@ async function main() {
     }
 
     // 等待发送按钮变为可用（最多等待 3 秒）
-    const sendBtnSelector = platform.sendButton.split(', ')[0]; // 取第一个选择器
+    const sendBtnSelector = platform.sendButton.split(',').map(s => s.trim())[0]; // 取第一个选择器
     try {
       await page.waitForFunction(
         (sel) => {
@@ -417,15 +417,15 @@ async function main() {
     }
 
 
-    // 通过页面上下文检测超限提示（不依赖类名）
+    // 检测超限提示（限制在通知/错误区域）
     const isOverLimit = await page.evaluate(() => {
-      const spans = document.querySelectorAll('span');
-      const regex = /(over limit|超出限制|超过限制|超出).*?\d+%/i;
-      for (const span of spans) {
-        const text = span.textContent.trim();
-        if (regex.test(text) && span.offsetParent !== null) {
-          return text;
-        }
+      const regex = /(over limit|超出限制|超过限制|超出).?\d+%/i;
+      // 优先搜索通知容器
+      const containers = document.querySelectorAll('.ds-notification-container, .ds-toast, .ds-message, .ds-alert, [class*="notification"]');
+      const searchRoots = containers.length > 0 ? containers : [document.body];
+      for (const root of searchRoots) {
+        const text = root.textContent.trim();
+        if (regex.test(text)) return text;
       }
       return null;
     });
