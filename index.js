@@ -155,69 +155,148 @@ async function main() {
       if (el && await el.isVisible()) return el;
     }
     return null;
-  }
+}
 
-  // 等待并精准提取最后一条 AI 回复（纯文本内容）
-  async function waitForReply(timeout = 300000) {
-    console.log('\x1b[35m[DEBUG] 等待最新 AI 回复完成...\x1b[0m');
-    const startTime = Date.now();
-    const pollInterval = 1000;
+// 检测重试按钮（中英文 + CSS 类名）
+async function detectRetryButton() {
+const retryPatterns = ['Retry', 'Refresh', 'refresh', 'retry'];
+try {
+const buttons = page.locator('button, [role="button"]');
+const count = await buttons.count();
+for (let i = 0; i < count; i++) {
+const btn = buttons.nth(i);
+try {
+const text = await btn.innerText({ timeout: 2000 });
+for (const pattern of retryPatterns) {
+if (text.includes(pattern)) {
+const visible = await btn.isVisible({ timeout: 2000 });
+if (visible) {
+console.log('[重试检测] 发现重试按钮: "' + text.trim() + '"');
+return btn;
+}
+}
+}
+} catch (e) {}
+}
+} catch (e) {}
+try {
+const warningBtns = page.locator('[role="button"].ds-button--warning, button.ds-button--warning');
+if (await warningBtns.count() > 0) {
+const btn = warningBtns.first();
+if (await btn.isVisible({ timeout: 2000 })) {
+console.log('[重试检测] 发现重试/警告按钮（CSS类名）');
+return btn;
+}
+}
+} catch (e) {}
+return null;
+}
 
-    while (Date.now() - startTime < timeout) {
-      // 不再主动检查 cancelState，让等待自然结束或超时
-      try {
-        const found = await page.evaluate(() => {
-          const items = document.querySelectorAll('[data-virtual-list-item-key]');
-          if (!items.length) return false;
-          const last = items[items.length - 1];
-          return !!(last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex'));
-        });
+// 检测错误文本（仅完整短语，避免误判）
+async function detectErrorText() {
+const errorPatterns = [
+'Something went wrong', 'An error occurred',
+'failed to generate', 'response was cut off', 'timed out',
+'Server busy', 'please try again', 'unavailable'
+];
+try {
+const bodyText = await page.locator('body').innerText({ timeout: 3000 });
+for (const pattern of errorPatterns) {
+if (bodyText.includes(pattern)) {
+console.log('[重试检测] 发现错误提示: "' + pattern + '"');
+return true;
+}
+}
+} catch (e) {}
+return false;
+}
 
-        if (found) {
-          console.log('\x1b[35m[DEBUG] 检测到完成信号，等待内容稳定...\x1b[0m');
-          await page.waitForTimeout(300);
-          let reply = await page.evaluate(() => {
-              const items = document.querySelectorAll('[data-virtual-list-item-key]');
-              if (!items.length) return '';
-              const last = items[items.length - 1];
-              const main = last.querySelector('.ds-assistant-message-main-content');
-              if (!main) return '';
-              // 使用 innerText 完美保留所有视觉换行
-              return main.innerText.trim();
-          });
+// 带重试检测的 waitForReply（已验证有效）
+async function waitForReply(timeout = 300000) {
+console.log('[DEBUG] 等待 AI 回复（支持重试检测）...');
+const startTime = Date.now();
+let lastRetryCheck = 0;
 
-          if (!reply) {
-            await page.waitForTimeout(500);
-            reply = await page.evaluate(() => {
-              const items = document.querySelectorAll('[data-virtual-list-item-key]');
-              if (!items.length) return '';
-              const last = items[items.length - 1];
-              const main = last.querySelector('.ds-assistant-message-main-content');
-              if (!main) return '';
-              let text = main.innerText.trim();
-              if (text.includes('User:') || text.includes('Assistant:')) return '';
-              return text;
-            });
-          }
+while (Date.now() - startTime < timeout) {
+try {
+// 每 3 秒检查一次重试/错误
+if (Date.now() - lastRetryCheck > 3000) {
+lastRetryCheck = Date.now();
 
-          console.log('\x1b[32m[DEBUG] 成功提取回复，长度:\x1b[0m', reply ? reply.length : 0);
-          return reply || '';
-        }
-      } catch (e) {
-        if (e.message && e.message.includes('Execution context')) {
-          console.log('\x1b[35m[DEBUG] 页面上下文失效，等待稳定...\x1b[0m');
-          await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-        } else {
-          console.log('\x1b[31m[DEBUG] 轮询异常:\x1b[0m', e.message);
-        }
-      }
+const retryBtn = await detectRetryButton();
+if (retryBtn) {
+console.log('[重试] 检测到重试按钮，自动点击...');
+try {
+await retryBtn.click();
+console.log('[重试] 已点击重试按钮，继续等待...');
+} catch (e) {
+console.log('[重试] 点击重试按钮失败:', e.message);
+}
+await page.waitForTimeout(1000);
+continue;
+}
 
-      await page.waitForTimeout(pollInterval);
-    }
+const hasError = await detectErrorText();
+if (hasError) {
+console.log('[重试] 检测到错误提示，等待页面恢复...');
+await page.waitForTimeout(3000);
+continue;
+}
+}
 
-    console.log('\x1b[31m[DEBUG] waitForReply 超时\x1b[0m');
-    return null;
-  }
+// 检测完成信号
+const found = await page.evaluate(() => {
+const items = document.querySelectorAll('[data-virtual-list-item-key]');
+if (!items.length) return false;
+const last = items[items.length - 1];
+return !!(last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex'));
+});
+
+if (found) {
+console.log('[DEBUG] 检测到完成信号，提取回复...');
+await page.waitForTimeout(300);
+
+let reply = await page.evaluate(() => {
+const items = document.querySelectorAll('[data-virtual-list-item-key]');
+if (!items.length) return '';
+const last = items[items.length - 1];
+const main = last.querySelector('.ds-assistant-message-main-content');
+if (!main) return '';
+return main.innerText.trim();
+});
+
+if (!reply) {
+await page.waitForTimeout(500);
+reply = await page.evaluate(() => {
+const items = document.querySelectorAll('[data-virtual-list-item-key]');
+if (!items.length) return '';
+const last = items[items.length - 1];
+const main = last.querySelector('.ds-assistant-message-main-content');
+if (!main) return '';
+let text = main.innerText.trim();
+if (text.includes('User:') || text.includes('Assistant:')) return '';
+return text;
+});
+}
+
+console.log('[DEBUG] 成功提取回复，长度:', reply ? reply.length : 0);
+return reply || '';
+}
+} catch (e) {
+if (e.message && e.message.includes('Execution context')) {
+console.log('[DEBUG] 页面上下文失效，等待稳定...');
+await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+} else {
+console.log('[DEBUG] 轮询异常:', e.message);
+}
+}
+
+await page.waitForTimeout(1000);
+}
+
+console.log('[DEBUG] waitForReply 超时');
+return null;
+}
 
   async function sendAndWait(text, cancelState = null) {
     console.log('\x1b[36m[DEBUG] === 发送消息 ===\x1b[0m');
