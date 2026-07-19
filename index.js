@@ -617,6 +617,8 @@ async function main() {
      * @returns {string|null} 清洗后的有效文本，若为空则返回 null
      */
     function cleanTaskCompletedMark(text) {
+      text = text.replace(/<[^>]*>/g, '');
+
       if (!text) return null;
       // 去除首尾空白
       const cleaned = text.trim();
