@@ -669,54 +669,53 @@ async function main() {
   - 注意是tool_call不是tool_calls
   - 绝对禁止使用 <parameter> 标签！不要使用 <parameter name="xxx">value</parameter> 这种格式！
   - 正确示例：
-    <tool_call name="read">
-    ======
-    filePath
-    ++++++
-    E:\\fata\\xest.xml
-    ======
-    offset
-    ++++++
-    10
-    ======
-    </tool_call>
     <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\fata\\xest.xml
-    ======
-    content
-    ++++++
-    public class Demo {
-        private String name = "示例";
-    }
-    ======
-    </tool_call>
-    <tool_call name="read">
-    ======
-    filePath
-    ++++++
-    E:\\fata\\xest.xml
-    ======
-    offset
-    ++++++
-    10
-    ======
-    </tool_call>
-    <tool_call name="read">
-    ======
-    filePath
-    ++++++
-    E:\\fata\\xest.xml
-    ======
-    offset
-    ++++++
-    10
-    ======
-    </tool_call>
-  【缩进规则】
-  edit/write 工具修改文件时，必须保持与目标文件完全一致的缩进风格。绝不允许生成顶格代码替换原本有缩进的代码。`;
+======
+filePath
+++++++
+E:\\fata\\xest.xml
+======
+content
+++++++
+public class Demo {
+    private String name = "示例";
+}
+======
+</tool_call>
+<tool_call name="write">
+======
+filePath
+++++++
+E:\\fata\\config.json
+======
+content
+++++++
+{
+  "name": "app",
+  "version": "1.0"
+}
+======
+</tool_call>
+<tool_call name="write">
+======
+filePath
+++++++
+E:\\fata\\Makefile
+======
+content
+++++++
+build:
+\t@echo Building...
+\trun: build
+\t@echo Running...
+======
+</tool_call>
+【缩进规则 - 最高优先级，必须严格遵守】
+在调用 edit/write 之前，必须先 read 目标文件，确认其缩进风格。
+目标文件用什么缩进（2空格/4空格/Tab），你的 newString/content 就必须用完全相同的缩进。
+绝不允许生成顶格代码替换原本有缩进的代码。
+绝不允许混用不同缩进风格。
+以上示例中的 write 分别演示了 4空格/2空格/Tab 三种缩进，请根据目标文件实际情况选择匹配的方式。`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -881,36 +880,68 @@ async function main() {
     20
     ======
     </tool_call>
-  - 多行/复杂内容示例：
-    <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\project\\Demo.java
-    ======
-    content
-    ++++++
-    public class Demo {
-        private String name = "示例";
-    }
-    ======
-    </tool_call>
-  - 可同时输出多个 <tool_call> 块。
-  【注意】：参数值中请勿包含独占一行的 “======” 或 “++++++”，否则会导致解析错误。如果必须包含，请用 Base64 编码等替代方式。
-  【执行修改后必须验证】
-  - 如果你调用了任何修改文件系统、数据库或配置的工具（如 write_file, replace_content, execute_command 等），在收到工具执行结果后，你必须紧接着调用读取或检查工具来验证修改是否成功。
-  - 验证成功后，你可以输出简短的确认信息（如“文件已成功修改”）；如果验证失败，必须报告具体错误。
-  【绝对禁止的格式】
-  1. 禁止使用 JSON 格式。
-  2. 禁止使用 <parameter> 标签传递参数，必须使用 ======/++++++ 分隔。
-  3. 禁止使用 <tool_calls> 等其他标签。
+  - 多行/复杂内容示例（4 空格缩进）：
+<tool_call name="write">
+======
+filePath
+++++++
+E:\\project\\Demo.java
+======
+content
+++++++
+public class Demo {
+    private String name = "示例";
+}
+======
+</tool_call>
+多行/复杂内容示例（2 空格缩进）：
+<tool_call name="write">
+======
+filePath
+++++++
+E:\\project\\config.json
+======
+content
+++++++
+{
+  "name": "app",
+  "version": "1.0"
+}
+======
+</tool_call>
+多行/复杂内容示例（Tab 缩进）：
+<tool_call name="write">
+======
+filePath
+++++++
+E:\\project\\Makefile
+======
+content
+++++++
+build:
+\t@echo Building...
+\trun: build
+\t@echo Running...
+======
+</tool_call>
+可同时输出多个 <tool_call> 块。
+【注意】：参数值中请勿包含独占一行的 “======” 或 “++++++”，否则会导致解析错误。如果必须包含，请用 Base64 编码等替代方式。
+【执行修改后必须验证】
+如果你调用了任何修改文件系统、数据库或配置的工具（如 write_file, replace_content, execute_command 等），在收到工具执行结果后，你必须紧接着调用读取或检查工具来验证修改是否成功。
+验证成功后，你可以输出简短的确认信息（如“文件已成功修改”）；如果验证失败，必须报告具体错误。
+【绝对禁止的格式】
+禁止使用 JSON 格式。
+禁止使用 <parameter> 标签传递参数，必须使用 ======/++++++ 分隔。
+禁止使用 <tool_calls> 等其他标签。
 如果不需要工具，直接回复文本。
-【缩进规则 - 必须严格遵守】
-使用 edit/write 工具修改文件时，必须保持与目标文件完全一致的缩进风格（空格/Tab、缩进宽度）
-构造 oldString 时，必须从目标文件原样复制足够多的上下文行（至少包含前后各 2-3 行），以便准确判断缩进模式
-构造 newString 时，缩进必须与 oldString 在目标文件中的缩进层级完全匹配
-如果目标文件使用 2 空格缩进，newString 也必须使用 2 空格缩进；如果使用 Tab，也必须用 Tab
-绝不允许生成顶格（无缩进）的代码来替换原本有缩进的代码`
+【缩进规则 - 最高优先级，必须严格遵守】
+在调用 edit/write 工具之前，必须先用 read 工具读取目标文件，确认其缩进风格。
+目标文件使用什么缩进（2空格/4空格/Tab），你的 newString/content 就必须使用完全相同的缩进。
+构造 oldString 时，必须从目标文件原样复制足够多的上下文行（至少包含前后各 2-3 行），以便准确判断缩进模式。
+构造 newString 时，缩进必须与 oldString 在目标文件中的缩进层级完全匹配。
+如果目标文件使用 2 空格缩进，newString 也必须使用 2 空格缩进；如果使用 Tab，也必须用 Tab。
+绝不允许生成顶格（无缩进）的代码来替换原本有缩进的代码。
+绝不允许将不同缩进风格的代码混合在同一个文件中。`
               : '';
 
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
