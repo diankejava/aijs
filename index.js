@@ -237,10 +237,11 @@ async function main() {
   // 带重试检测的 waitForReply
   async function waitForReply(timeout = 300000) {
     console.log('[DEBUG] 等待 AI 回复（支持重试检测）...');
-    const startTime = Date.now();
+    // const startTime = Date.now();
     let lastRetryCheck = 0;
 
-    while (Date.now() - startTime < timeout) {
+    // while (Date.now() - startTime < timeout) {
+    while (true) {
       try {
         // ===== 1. 优先检查是否已有完整回复（无论页面是否显示错误） =====
         const found = await page.evaluate(() => {
@@ -400,7 +401,7 @@ async function main() {
           return btn && !btn.disabled && btn.offsetParent !== null;
         },
         sendBtnSelector,
-        { timeout: 3000 }
+        { timeout: 5000 }
       );
     } catch (_) {
       console.log('[HTTP] 等待发送按钮可用超时，仍尝试发送');
