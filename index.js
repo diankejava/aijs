@@ -513,17 +513,20 @@ async function main() {
 
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
-          // 判断当前行（去除空白后）是否包含连续至少5个 =，视为参数分隔行
-          if (/={5,}/.test(line.trim())) {
-            flush();
-            continue;
-          }
-          // 判断当前行（去除空白后）是否包含连续至少5个 +，视为键值分隔行
-          if (/\+{5,}/.test(line.trim())) {
-            if (currentKey) {
+          // 检测疑似分隔符行（包含连续3个以上 =、+ 或 ~）
+          const trimmed = line.trim();
+          if (/={3,}/.test(trimmed) || /\+{3,}/.test(trimmed) || /~{3,}/.test(trimmed)) {
+            // 有效分隔符：连续至少6个 = 视为参数分隔，连续至少6个 + 视为键值分隔
+            if (/={6,}/.test(trimmed)) {
+              flush();
               continue;
             }
-            continue;
+            if (/\+{6,}/.test(trimmed)) {
+              continue;
+            }
+            // 疑似分隔符但长度不足（如 +++、+++~~~、==== 等），返回 null 触发纠正
+            console.log('[ToolCall] 分隔符格式错误，长度不足6个:', trimmed);
+            return null;
           }
 
           // 正常行
@@ -665,7 +668,7 @@ async function main() {
             `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
   - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，然后直到下一个 “======” 或结束的所有行都是参数值。
   - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
-  - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
+  - 注意：分隔符必须至少 6 个连续等号（======）作为参数分隔符，至少 6 个连续加号（++++++）作为键值分隔符。====== 用于分隔不同参数，++++++ 用于分隔参数名和参数值，两者不可混用。
   - 每个 <tool_call> 必须用 </tool_call> 闭合
   - 注意是tool_call不是tool_calls
   - 绝对禁止使用 <parameter> 标签！不要使用 <parameter name="xxx">value</parameter> 这种格式！
