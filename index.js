@@ -517,11 +517,11 @@ async function main() {
           const trimmed = line.trim();
           if (/={3,}/.test(trimmed) || /\+{3,}/.test(trimmed) || /~{3,}/.test(trimmed)) {
             // 有效分隔符：连续至少6个 = 视为参数分隔，连续至少6个 + 视为键值分隔
-            if (/={4,}/.test(trimmed)) {
+            if (/^={4,}$/.test(trimmed)) {
               flush();
               continue;
             }
-            if (/\+{4,}/.test(trimmed)) {
+            if (/^\+{4,}/.test(trimmed)) {
               continue;
             }
             // 疑似分隔符但长度不足（如 +++、+++~~~、==== 等），返回 null 触发纠正
