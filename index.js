@@ -515,24 +515,21 @@ async function main() {
           const line = lines[i];
           // 检测疑似分隔符行（包含连续3个以上 =、+ 或 ~）
           const trimmed = line.trim();
-          if (/={3,}/.test(trimmed) || /\+{3,}/.test(trimmed) || /~{3,}/.test(trimmed)) {
-            // 有效分隔符：连续至少6个 = 视为参数分隔，连续至少6个 + 视为键值分隔
-            if (/^={4,}$/.test(trimmed)) {
-              flush();
+
+          // 匹配以至少4个等号开头的行作为参数分隔符
+          if (/^={4,}/.test(trimmed)) {
+              flush();          // 参数分隔符
               continue;
-            }
-            if (/^\+{4,}/.test(trimmed)) {
+          }
+          if (/^\+{4,}/.test(trimmed)) {
+              // 键值分隔符，直接忽略
               continue;
-            }
-            // 疑似分隔符但长度不足（如 +++、+++~~~、==== 等），返回 null 触发纠正
-            console.log('[ToolCall] 分隔符格式错误，长度不足6个:', trimmed);
-            return null;
           }
 
           // 正常行
           if (!currentKey) {
             // 还没有 key，则本行作为 key（去除首尾空白及所有内部空白）
-            currentKey = line.trim().replace(/\s+/g, '');
+            currentKey = trimmed.replace(/\s+/g, '');
           } else {
             // 已有 key，追加到 value 行
             currentValueLines.push(line);
@@ -941,7 +938,13 @@ build:
 禁止使用 JSON 格式。
 禁止使用 <parameter> 标签传递参数，必须使用 ======/++++++ 分隔。
 禁止使用 <tool_calls> 等其他标签。
-如果不需要工具，直接回复文本。`
+如果不需要工具，直接回复文本。
+【普通回复规则】
+如果当前回复不需要调用任何工具，请直接输出纯文本回答，绝对禁止出现以下任何内容：
+- <tool_call> 或 </tool_call> 标签
+- 独占一行的 "======" 或 "++++++"
+- 任何形式的参数分隔符
+普通回复中不应包含上述任何特殊符号，否则会导致解析错误。`
               : '';
 
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
