@@ -564,6 +564,12 @@ async function main() {
           continue;
         }
 
+        // ★ 新增：处理无参数的工具调用
+        if (rawArgs === '') {
+          results.push({ success: true, toolCall: { name: rawName, arguments: {} } });
+          continue;
+        }
+
         // 直接使用原始参数文本，仅确保首尾有换行（innerText 已提供正确换行）
         let fixedArgs = '\n' + rawArgs.trim() + '\n';
         const parsedArgs = parseKeyValueArgs(fixedArgs);
@@ -714,13 +720,7 @@ build:
 \trun: build
 \t@echo Running...
 ======
-</tool_call>
-【缩进规则 - 最高优先级，必须严格遵守】
-在调用 edit/write 之前，必须先 read 目标文件，确认其缩进风格。
-目标文件用什么缩进（2空格/4空格/Tab），你的 newString/content 就必须用完全相同的缩进。
-绝不允许生成顶格代码替换原本有缩进的代码。
-绝不允许混用不同缩进风格。
-以上示例中的 write 分别演示了 4空格/2空格/Tab 三种缩进，请根据目标文件实际情况选择匹配的方式。`;
+</tool_call>`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -888,7 +888,7 @@ build:
     20
     ======
     </tool_call>
-  - 多行/复杂内容示例（4 空格缩进）：
+  - 多行/复杂内容示例：
     <tool_call name="write">
     ======
     filePath
@@ -902,7 +902,7 @@ build:
     }
     ======
     </tool_call>
-    多行/复杂内容示例（2 空格缩进）：
+    多行/复杂内容示例：
     <tool_call name="write">
     ======
     filePath
@@ -917,7 +917,7 @@ build:
     }
     ======
     </tool_call>
-    多行/复杂内容示例（Tab 缩进）：
+    多行/复杂内容示例：
     <tool_call name="write">
     ======
     filePath
@@ -941,15 +941,7 @@ build:
 禁止使用 JSON 格式。
 禁止使用 <parameter> 标签传递参数，必须使用 ======/++++++ 分隔。
 禁止使用 <tool_calls> 等其他标签。
-如果不需要工具，直接回复文本。
-【缩进规则 - 最高优先级，必须严格遵守】
-在调用 edit/write 工具之前，必须先用 read 工具读取目标文件，确认其缩进风格。
-目标文件使用什么缩进（2空格/4空格/Tab），你的 newString/content 就必须使用完全相同的缩进。
-构造 oldString 时，必须从目标文件原样复制足够多的上下文行（至少包含前后各 2-3 行），以便准确判断缩进模式。
-构造 newString 时，缩进必须与 oldString 在目标文件中的缩进层级完全匹配。
-如果目标文件使用 2 空格缩进，newString 也必须使用 2 空格缩进；如果使用 Tab，也必须用 Tab。
-绝不允许生成顶格（无缩进）的代码来替换原本有缩进的代码。
-绝不允许将不同缩进风格的代码混合在同一个文件中。`
+如果不需要工具，直接回复文本。`
               : '';
 
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
