@@ -517,11 +517,11 @@ async function main() {
           const trimmed = line.trim();
           if (/={3,}/.test(trimmed) || /\+{3,}/.test(trimmed) || /~{3,}/.test(trimmed)) {
             // 有效分隔符：连续至少6个 = 视为参数分隔，连续至少6个 + 视为键值分隔
-            if (/={6,}/.test(trimmed)) {
+            if (/={4,}/.test(trimmed)) {
               flush();
               continue;
             }
-            if (/\+{6,}/.test(trimmed)) {
+            if (/\+{4,}/.test(trimmed)) {
               continue;
             }
             // 疑似分隔符但长度不足（如 +++、+++~~~、==== 等），返回 null 触发纠正
@@ -653,7 +653,7 @@ async function main() {
               toolCall: parseResult.toolCall,
               toolCalls: parseResult.toolCalls,
               rawOutput,
-              assistantContent: textContent || null               // 为空则返回 null
+              assistantContent: cleanTaskCompletedMark(textContent) || null               // 为空则返回 null
             };
           }
           console.log('[ToolCall] 格式错误，继续纠正...');
@@ -668,10 +668,11 @@ async function main() {
             `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
   - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，然后直到下一个 “======” 或结束的所有行都是参数值。
   - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
-  - 注意：分隔符必须至少 6 个连续等号（======）作为参数分隔符，至少 6 个连续加号（++++++）作为键值分隔符。====== 用于分隔不同参数，++++++ 用于分隔参数名和参数值，两者不可混用。
+  - 注意：分隔符必须至少 6 个连续等号（======）作为参数分隔符，至少 6 个连续加号（++++++）作为键值分隔符。禁止使用少于 6 个、掺杂 ~ 或其他字符（如 ++++~~、=====、+++++++ 等都是错误的）。====== 用于分隔不同参数，++++++ 用于分隔参数名和参数值，两者不可混用。
   - 每个 <tool_call> 必须用 </tool_call> 闭合
   - 注意是tool_call不是tool_calls
   - 绝对禁止使用 <parameter> 标签！不要使用 <parameter name="xxx">value</parameter> 这种格式！
+  - 编辑文本时，必须使用自带的编辑工具，不使用bash剪辑编辑。
   - 正确示例：
     <tool_call name="write">
 ======
@@ -857,6 +858,7 @@ build:
               ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
   - 每个 <tool_call> 必须用 </tool_call> 闭合
   - 注意是tool_call，不是tool_calls
+  - 编辑文本时，必须使用自带的编辑工具，不使用bash剪辑编辑。
   - 每个 <tool_call> 块使用以下格式传递参数，完全不需要任何转义：
     <tool_call name="函数名">
     ======
@@ -885,49 +887,49 @@ build:
     ======
     </tool_call>
   - 多行/复杂内容示例（4 空格缩进）：
-<tool_call name="write">
-======
-filePath
-++++++
-E:\\project\\Demo.java
-======
-content
-++++++
-public class Demo {
-    private String name = "示例";
-}
-======
-</tool_call>
-多行/复杂内容示例（2 空格缩进）：
-<tool_call name="write">
-======
-filePath
-++++++
-E:\\project\\config.json
-======
-content
-++++++
-{
-  "name": "app",
-  "version": "1.0"
-}
-======
-</tool_call>
-多行/复杂内容示例（Tab 缩进）：
-<tool_call name="write">
-======
-filePath
-++++++
-E:\\project\\Makefile
-======
-content
-++++++
-build:
-\t@echo Building...
-\trun: build
-\t@echo Running...
-======
-</tool_call>
+    <tool_call name="write">
+    ======
+    filePath
+    ++++++
+    E:\\project\\Demo.java
+    ======
+    content
+    ++++++
+    public class Demo {
+        private String name = "示例";
+    }
+    ======
+    </tool_call>
+    多行/复杂内容示例（2 空格缩进）：
+    <tool_call name="write">
+    ======
+    filePath
+    ++++++
+    E:\\project\\config.json
+    ======
+    content
+    ++++++
+    {
+      "name": "app",
+      "version": "1.0"
+    }
+    ======
+    </tool_call>
+    多行/复杂内容示例（Tab 缩进）：
+    <tool_call name="write">
+    ======
+    filePath
+    ++++++
+    E:\\project\\Makefile
+    ======
+    content
+    ++++++
+    build:
+    \t@echo Building...
+    \trun: build
+    \t@echo Running...
+    ======
+    </tool_call>
 可同时输出多个 <tool_call> 块。
 【注意】：参数值中请勿包含独占一行的 “======” 或 “++++++”，否则会导致解析错误。如果必须包含，请用 Base64 编码等替代方式。
 【执行修改后必须验证】
