@@ -741,7 +741,9 @@ build:
               .filter(line => !langKeywords.test(line.trim()))
               .join('\n')
               .trim();
-            return { toolCall: null, toolCalls: [], rawOutput: finalText || rawOutput, assistantContent: null };
+
+             const cleaned = cleanTaskCompletedMark(finalText);
+            return { toolCall: null, toolCalls: [], rawOutput: cleaned || rawOutput, assistantContent: null };
           }
         }
       } else {
