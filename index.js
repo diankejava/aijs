@@ -495,17 +495,28 @@ async function main() {
 
         const flush = () => {
           if (currentKey) {
-            let value = currentValueLines.join('\n').trim();
-            // 去除末尾空行
-            value = value.replace(/\n+$/, '');
-            // 智能类型转换：纯数字字符串自动转 Number
-            const cleanedValue = value.replace(/\s+/g, '');
-            const numVal = Number(cleanedValue);
-            if (cleanedValue !== '' && !isNaN(numVal) && String(numVal) === cleanedValue) {
-              args[currentKey] = numVal;
-            } else {
-              args[currentKey] = value;
+            // 保留开头空白，只去除末尾连续的空行
+            let value = currentValueLines.join('\n').replace(/\n+$/, '');
+
+            // 对内容型参数，将字面量 \n 还原为真实换行符
+            const contentKeys = ['content', 'text', 'code', 'body', 'source', 'data'];
+            if (contentKeys.includes(currentKey)) {
+              value = value.replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
             }
+
+            // 智能类型转换：纯数字字符串自动转 Number（内容型参数除外）
+            if (!contentKeys.includes(currentKey)) {
+              const cleanedValue = value.replace(/\s+/g, '');
+              const numVal = Number(cleanedValue);
+              if (cleanedValue !== '' && !isNaN(numVal) && String(numVal) === cleanedValue) {
+                args[currentKey] = numVal;
+                currentKey = null;
+                currentValueLines = [];
+                return;
+              }
+            }
+
+            args[currentKey] = value;
             currentKey = null;
             currentValueLines = [];
           }
@@ -678,46 +689,43 @@ async function main() {
   - 编辑文本时，必须使用自带的编辑工具，不使用bash剪辑编辑。
   - 正确示例：
     <tool_call name="write">
-======
-filePath
-++++++
-E:\\fata\\xest.xml
-======
-content
-++++++
-public class Demo {
-    private String name = "示例";
-}
-======
-</tool_call>
-<tool_call name="write">
-======
-filePath
-++++++
-E:\\fata\\config.json
-======
-content
-++++++
-{
-  "name": "app",
-  "version": "1.0"
-}
-======
-</tool_call>
-<tool_call name="write">
-======
-filePath
-++++++
-E:\\fata\\Makefile
-======
-content
-++++++
-build:
-\t@echo Building...
-\trun: build
-\t@echo Running...
-======
-</tool_call>`;
+    ======
+    filePath
+    ++++++
+    E:\\project\\Demo.java
+    ======
+    content
+    ++++++
+    public class Demo {\\n        private String name = "示例";\\n    }
+    ======
+    </tool_call>
+    多行/复杂内容示例：
+    <tool_call name="write">
+    ======
+    filePath
+    ++++++
+    E:\\project\\config.json
+    ======
+    content
+    ++++++
+    {\\n  "name": "app",\\n  "version": "1.0"\\n}
+    ======
+    </tool_call>
+    多行/复杂内容示例：
+    <tool_call name="write">
+    ======
+    filePath
+    ++++++
+    E:\\project\\Makefile
+    ======
+    content
+    ++++++
+    build:\\n\\t@echo Building...\\n\\trun: build\\n\\t@echo Running...
+    ======
+    </tool_call>
+    【写文件/编辑文件内容格式强制要求】
+当调用 write / edit 等工具且传递 content 参数时，必须将所有换行符替换为 \\n。
+整个 content 值必须放在一行内，禁止出现真实的多行文本。`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -874,7 +882,7 @@ build:
     ======
     filePath
     ++++++
-    E:\\kytion-boot\\video\\src\\main\\resources\\mapper\\matrix\\UserImsIceMapper.xml
+    E:\\boot\\UserImsIceMapper.xml
     ======
     offset
     ++++++
@@ -894,9 +902,7 @@ build:
     ======
     content
     ++++++
-    public class Demo {
-        private String name = "示例";
-    }
+    public class Demo {\\n    private String name = "示例";\\n}
     ======
     </tool_call>
     多行/复杂内容示例：
@@ -908,10 +914,7 @@ build:
     ======
     content
     ++++++
-    {
-      "name": "app",
-      "version": "1.0"
-    }
+    {\\n  "name": "app",\\n  "version": "1.0"\\n}
     ======
     </tool_call>
     多行/复杂内容示例：
@@ -923,14 +926,19 @@ build:
     ======
     content
     ++++++
-    build:
-    \t@echo Building...
-    \trun: build
-    \t@echo Running...
+    build:\\n\\t@echo Building...\\n\\trun: build\\n\\t@echo Running...
     ======
     </tool_call>
 可同时输出多个 <tool_call> 块。
 【注意】：参数值中请勿包含独占一行的 “======” 或 “++++++”，否则会导致解析错误。如果必须包含，请用 Base64 编码等替代方式。
+【写文件/编辑文件内容格式强制要求】
+当调用 write / edit 等工具且传递 content 参数时，必须将所有换行符替换为 \\n（两个字符：反斜杠 + 小写字母 n）。
+整个 content 值必须放在一行内，禁止出现真实的多行文本。
+content 参数中也不能包含真实的反斜杠加 n 字符组合，如果文本本身需要 \\n 请使用 \\\\n 表示。
+例如原内容为：
+  line1
+  line2
+则 content 值应为 "line1\\nline2"。
 【执行修改后必须验证】
 如果你调用了任何修改文件系统、数据库或配置的工具（如 write_file, replace_content, execute_command 等），在收到工具执行结果后，你必须紧接着调用读取或检查工具来验证修改是否成功。
 验证成功后，你可以输出简短的确认信息（如“文件已成功修改”）；如果验证失败，必须报告具体错误。
