@@ -944,7 +944,19 @@ build:
 - <tool_call> 或 </tool_call> 标签
 - 独占一行的 "======" 或 "++++++"
 - 任何形式的参数分隔符
-普通回复中不应包含上述任何特殊符号，否则会导致解析错误。`
+普通回复中不应包含上述任何特殊符号，否则会导致解析错误。
+[Playwright 工具使用经验 - 已验证有效流程]
+步骤1: browser_navigate 直接访问目标数据API的URL，并携带必要的查询参数。
+步骤2: browser_run_code_unsafe 执行复杂的JS逻辑（如异步数据处理、多步骤操作等），这是唯一能运行较长JS代码的方式。
+步骤3: browser_evaluate 仅用于简单查询（如提取页面元素或返回简单值），避免使用复杂箭头函数或async，否则可能触发语法错误。
+步骤4: 在连续请求之间加入适当的休眠间隔，避免请求频率过高触发限制。
+[关键踩坑记录]
+browser_evaluate 的 expression 参数报错 → 改用 function 参数
+browser_evaluate 不支持长代码 → 改用 browser_run_code_unsafe
+PowerShell 不支持 && 链式命令，需用 ; if ($?) { }
+Python 和 pip 均不在系统 PATH 中，无法运行 .py 脚本
+webfetch 可能被东方财富识别反爬 → 优先用 Playwright
+任务未完成前必须持续用工具调用，否则会中断`
               : '';
 
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
