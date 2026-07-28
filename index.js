@@ -200,7 +200,9 @@ async function main() {
       const last = items[items.length - 1];
       const main = last.querySelector('.ds-assistant-message-main-content');
       if (!main) return '';
-      let text = main.innerText.trim();
+      let text = main.innerText;               // 移除 .trim()
+      text = text.replace(/^\s*\n/, '');       // 去除开头空行
+      text = text.replace(/\n\s*$/, '');       // 去除结尾空行
       if (text.includes('User:') || text.includes('Assistant:')) return '';
       return text;
     });
@@ -489,6 +491,11 @@ async function main() {
       // 支持用任意数量的 = 或 + 组成的独立行作为分隔符
       const parseKeyValueArgs = (text) => {
         const args = {};
+        // 容错：强制分隔符独占一行
+        text = text.replace(/([^\n=])(={4,})/g, '$1\n$2');
+        text = text.replace(/([^\n+])(\+{4,})/g, '$1\n$2');
+        text = text.replace(/(={4,})([^\n=])/g, '$1\n$2');
+        text = text.replace(/(\+{4,})([^\n+])/g, '$1\n$2');
         const lines = text.split('\n');
         let currentKey = null;
         let currentValueLines = [];
@@ -524,25 +531,24 @@ async function main() {
 
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
-          // 检测疑似分隔符行（包含连续3个以上 =、+ 或 ~）
           const trimmed = line.trim();
 
-          // 匹配以至少4个等号开头的行作为参数分隔符
-          if (/^={4,}/.test(trimmed)) {
-              flush();          // 参数分隔符
-              continue;
-          }
-          if (/^\+{4,}/.test(trimmed)) {
-              // 键值分隔符，直接忽略
-              continue;
+          // ★ 添加空行跳过逻辑
+          if (trimmed === '' && currentKey === null) {
+            continue;
           }
 
-          // 正常行
+          if (/^={4,}/.test(trimmed)) {
+            flush();
+            continue;
+          }
+          if (/^\+{4,}/.test(trimmed)) {
+            continue;
+          }
+
           if (!currentKey) {
-            // 还没有 key，则本行作为 key（去除首尾空白及所有内部空白）
             currentKey = trimmed.replace(/\s+/g, '');
           } else {
-            // 已有 key，追加到 value 行
             currentValueLines.push(line);
           }
         }
@@ -680,7 +686,7 @@ async function main() {
           const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n` +
             `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
             `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
-  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，然后直到下一个 “======” 或结束的所有行都是参数值。
+  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值（只能占一行）。参数值中不得包含真实的换行符，必须用 \\n 替代。
   - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
   - 注意：分隔符必须至少 6 个连续等号（======）作为参数分隔符，至少 6 个连续加号（++++++）作为键值分隔符。禁止使用少于 6 个、掺杂 ~ 或其他字符（如 ++++~~、=====、+++++++ 等都是错误的）。====== 用于分隔不同参数，++++++ 用于分隔参数名和参数值，两者不可混用。
   - 每个 <tool_call> 必须用 </tool_call> 闭合
@@ -866,16 +872,16 @@ async function main() {
   - 每个 <tool_call> 必须用 </tool_call> 闭合
   - 注意是tool_call，不是tool_calls
   - 编辑文本时，必须使用自带的编辑工具，不使用bash剪辑编辑。
-  - 每个 <tool_call> 块使用以下格式传递参数，完全不需要任何转义：
+  - 每个 <tool_call> 块使用以下格式传递参数。**参数值中如果需要表示换行，必须写成 \\n，不得出现真实的换行符**；其他字符无需转义：
     <tool_call name="函数名">
     ======
     参数名
     ++++++
-    参数值（可以包含多行、双引号、反斜杠等）
+    参数值（单行，用 \\n 表示换行）
     ======
     ...
     </tool_call>
-  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，之后直到下一个 “======” 之前的所有行都是该参数的值（可包含任意字符）。
+  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值（只能占一行）。参数值中不得包含真实的换行符，必须用 \\n 替代。
   - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
   - 简单参数示例：
     <tool_call name="read">
