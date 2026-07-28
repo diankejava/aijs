@@ -686,7 +686,7 @@ async function main() {
           const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n` +
             `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
             `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
-  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值（只能占一行）。参数值中不得包含真实的换行符，必须用 \\n 替代。
+  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。参数值中不得包含真实的换行符，必须用 \\n 替代，如果没有参数，标签里面直接空的就行，不要有分隔符。
   - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
   - 注意：分隔符必须至少 6 个连续等号（======）作为参数分隔符，至少 6 个连续加号（++++++）作为键值分隔符。禁止使用少于 6 个、掺杂 ~ 或其他字符（如 ++++~~、=====、+++++++ 等都是错误的）。====== 用于分隔不同参数，++++++ 用于分隔参数名和参数值，两者不可混用。
   - 每个 <tool_call> 必须用 </tool_call> 闭合
@@ -744,7 +744,7 @@ async function main() {
           if (!parseResult.found) {
             // 模型拒绝输出工具调用，将当前文本作为最终回复返回
             console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
-            const langKeywords = /^(java|text|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
+            const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
             let finalText = rawOutput
               .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
               .replace(/(复制|下载|运行|调试|代码)/g, '')
@@ -760,7 +760,7 @@ async function main() {
       } else {
         // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
         // 清洗 UI 杂讯，仅在纯文本模式下进行
-        const langKeywords = /^(java|text|python|javascript|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
+        const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
         let cleanText = rawOutput
           .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
           .replace(/(复制|下载|运行|调试|代码)/g, '')
@@ -881,7 +881,7 @@ async function main() {
     ======
     ...
     </tool_call>
-  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值（只能占一行）。参数值中不得包含真实的换行符，必须用 \\n 替代。
+  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。参数值中不得包含真实的换行符，必须用 \\n 替代。
   - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
   - 简单参数示例：
     <tool_call name="read">
