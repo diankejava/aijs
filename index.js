@@ -194,17 +194,65 @@ async function main() {
 
   // 提取最后一条 AI 回复（公共函数，消除重复代码）
   async function extractLastReply() {
+    try {
+        // 阶段①：拦截剪贴板 + 点击复制按钮
+        const btnClicked = await page.evaluate(() => {
+            const items = document.querySelectorAll('[data-virtual-list-item-key]');
+            if (!items.length) return false;
+            const last = items[items.length - 1];
+            const main = last.querySelector('.ds-assistant-message-main-content');
+            if (!main) return false;
+
+            const divBtns = last.querySelector('.ds-flex').querySelectorAll('div[role="button"]');
+            if (!divBtns.length) return false;
+
+            const copyBtn = divBtns[0];
+            const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+            // 将捕获的文本挂到 window 上，供外部读取
+            window.__capturedReply = null;
+            navigator.clipboard.writeText = function(text) {
+                window.__capturedReply = text;
+                return origWrite(text);
+            };
+            copyBtn.click();
+            return true;
+        });
+
+        if (!btnClicked) return fallbackExtract(); // 降级
+
+        // 阶段②：等待 DeepSeek 写入剪贴板
+        await page.waitForTimeout(500);
+
+        const reply = await page.evaluate(() => {
+            const text = window.__capturedReply;
+            delete window.__capturedReply;
+            return text || '';
+        });
+
+        if (!reply) return fallbackExtract();
+
+        // 去除开头结尾空行 & 过滤非 AI 回复
+        let cleaned = reply.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
+        if (cleaned.includes('User:') || cleaned.includes('Assistant:')) return '';
+        return cleaned;
+
+    } catch (e) {
+        return fallbackExtract();
+    }
+  }
+  // 降级方案：innerText
+  async function fallbackExtract() {
     return await page.evaluate(() => {
-      const items = document.querySelectorAll('[data-virtual-list-item-key]');
-      if (!items.length) return '';
-      const last = items[items.length - 1];
-      const main = last.querySelector('.ds-assistant-message-main-content');
-      if (!main) return '';
-      let text = main.innerText;               // 移除 .trim()
-      text = text.replace(/^\s*\n/, '');       // 去除开头空行
-      text = text.replace(/\n\s*$/, '');       // 去除结尾空行
-      if (text.includes('User:') || text.includes('Assistant:')) return '';
-      return text;
+        const items = document.querySelectorAll('[data-virtual-list-item-key]');
+        if (!items.length) return '';
+        const last = items[items.length - 1];
+        const main = last.querySelector('.ds-assistant-message-main-content');
+        if (!main) return '';
+        let text = main.innerText;
+        text = text.replace(/^\s*\n/, '');
+        text = text.replace(/\n\s*$/, '');
+        if (text.includes('User:') || text.includes('Assistant:')) return '';
+        return text;
     });
   }
 
