@@ -394,7 +394,23 @@ async function main() {
           return !!(last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex'));
         });
 
-        if (found) {
+        // 2. 检查发送按钮是否已经恢复为非停止状态
+        let sendBtnReady = false;
+        const sendBtn = await findSendButton();
+        if (sendBtn) {
+            try {
+                sendBtnReady = await sendBtn.evaluate(el => {
+                    const text = (el.textContent || '').trim();
+                    const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+                    const isStop = /停止|stop|halt/i.test(text + ariaLabel);
+                    return !el.disabled && !isStop;
+                });
+            } catch (e) {
+                // 如果按钮不可访问，忽略
+            }
+        }
+
+        if (found && sendBtnReady) {
           console.log('[DEBUG] 检测到完成信号，提取回复...');
           await page.waitForTimeout(300);
 
