@@ -52,44 +52,31 @@ async function main() {
     });
   }
 
-  let storageState = null;
-  if (fs.existsSync(storageStateFile)) {
-    try {
-      storageState = JSON.parse(fs.readFileSync(storageStateFile, 'utf8'));
-      console.log('检测到已保存的登录凭证，尝试自动登录...');
-    } catch (_) {
-      console.log('存储状态文件损坏，将重新登录。');
-      storageState = null;
+  // ===== 浏览器自动恢复相关变量 =====
+  let browser;
+  let page;
+  let isRestarting = false;
+  let consecutiveRestarts = 0;
+  const MAX_RESTARTS = 5; // 连续崩溃次数上限
+
+  // 封装登录等待逻辑（原代码中的循环部分）
+  async function waitForLogin(page) {
+    const editorSelectors = platform.editor.split(',').map(s => s.trim());
+    let loggedIn = false;
+
+    // 先快速检查是否已经登录
+    for (const sel of editorSelectors) {
+      try {
+        const el = await page.$(sel);
+        if (el && await el.isVisible()) {
+          loggedIn = true;
+          break;
+        }
+      } catch (_) {}
     }
-  }
 
-  const browser = await chromium.launchPersistentContext(userDataDir, {
-    headless: false,
-    args: ['--no-sandbox'],
-    storageState: storageState || undefined
-  });
+    if (loggedIn) return;
 
-  const page = browser.pages()[0] || await browser.newPage();
-
-  await page.goto(platform.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  console.log(`页面已打开，等待登录到 ${platform.name}...`);
-
-  const editorSelectors = platform.editor.split(',').map(s => s.trim());
-  let loggedIn = false;
-
-  for (const sel of editorSelectors) {
-    try {
-      const el = await page.$(sel);
-      if (el && await el.isVisible()) {
-        loggedIn = true;
-        break;
-      }
-    } catch (_) { }
-  }
-
-  if (loggedIn) {
-    console.log('登录凭证有效，已自动登录！\n');
-  } else {
     console.log('未检测到有效凭证，请在浏览器中扫码登录（最多等待5分钟）...');
     const loginStart = Date.now();
     let lastLog = 0;
@@ -109,7 +96,7 @@ async function main() {
       } catch (e) {
         if (e.message && e.message.includes('Execution context')) {
           console.log('  检测到页面跳转，等待稳定后重试...');
-          try { await page.waitForLoadState('domcontentloaded', { timeout: 15000 }); } catch (_) { }
+          try { await page.waitForLoadState('domcontentloaded', { timeout: 15000 }); } catch (_) {}
         } else {
           throw e;
         }
@@ -123,21 +110,83 @@ async function main() {
     }
 
     if (!loggedIn) {
-      console.log('登录超时（5分钟），请重新运行。');
-      await browser.close();
-      process.exit(1);
+      throw new Error('登录超时（5分钟），无法恢复浏览器状态');
     }
 
+    // 保存登录凭证（可能已更新）
     try {
-      const state = await browser.storageState();
-      fs.writeFileSync(storageStateFile, JSON.stringify(state, null, 2));
-      console.log('登录凭证已永久保存，下次启动无需重新登录。\n');
+        const state = await page.context().storageState();
+        fs.writeFileSync(storageStateFile, JSON.stringify(state, null, 2));
+        console.log('登录凭证已保存。');
     } catch (e) {
-      console.log('警告: 保存登录凭证失败，下次可能需要重新登录。');
+        console.log('警告: 保存登录凭证失败。');
     }
   }
 
-  console.log('登录成功！可以开始对话了。\n');
+  // 初始化浏览器和页面
+  async function initBrowserAndPage() {
+    let storageState = null;
+    if (fs.existsSync(storageStateFile)) {
+      try {
+        storageState = JSON.parse(fs.readFileSync(storageStateFile, 'utf8'));
+        console.log('检测到已保存的登录凭证，尝试自动登录...');
+      } catch (_) {
+        console.log('存储状态文件损坏，将重新登录。');
+        storageState = null;
+      }
+    }
+
+    const newBrowser = await chromium.launchPersistentContext(userDataDir, {
+      headless: false,
+      args: ['--no-sandbox'],
+      storageState: storageState || undefined
+    });
+
+    // 监听崩溃事件
+    newBrowser.on('disconnected', async () => {
+      console.log('\x1b[31m[浏览器] 检测到浏览器进程断开，准备自动重启...\x1b[0m');
+      if (isRestarting) return;
+      isRestarting = true;
+
+      if (consecutiveRestarts >= MAX_RESTARTS) {
+        console.error(`[浏览器] 连续重启 ${MAX_RESTARTS} 次仍崩溃，请检查环境后手动重启程序。`);
+        process.exit(1);
+      }
+
+      try {
+        await new Promise(r => setTimeout(r, 3000)); // 等待资源释放
+        const result = await initBrowserAndPage();    // 递归重启
+        browser = result.browser;
+        page = result.page;
+        consecutiveRestarts = 0;                      // 成功重启后清零计数
+        console.log('\x1b[32m[浏览器] 浏览器已成功恢复。\x1b[0m');
+      } catch (e) {
+        consecutiveRestarts++;
+        console.error(`[浏览器] 重启失败 (${consecutiveRestarts}/${MAX_RESTARTS}):`, e.message);
+        if (consecutiveRestarts >= MAX_RESTARTS) {
+          console.error('[浏览器] 达到最大重启次数，退出程序。');
+          process.exit(1);
+        }
+      } finally {
+        isRestarting = false;
+      }
+    });
+
+    const newPage = newBrowser.pages()[0] || await newBrowser.newPage();
+
+    await newPage.goto(platform.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    console.log(`页面已打开，等待登录到 ${platform.name}...`);
+
+    await waitForLogin(newPage);
+    console.log('登录成功！可以开始对话了。\n');
+
+    return { browser: newBrowser, page: newPage };
+  }
+
+  // 初始化（替代原来的 const browser = ... 和 const page = ...）
+  const initResult = await initBrowserAndPage();
+  browser = initResult.browser;
+  page = initResult.page;
 
   async function findEditor() {
     const selectors = platform.editor.split(',').map(s => s.trim());
@@ -195,7 +244,7 @@ async function main() {
   // 提取最后一条 AI 回复（公共函数，消除重复代码）
   async function extractLastReply() {
     try {
-        // 阶段①：拦截剪贴板 + 点击复制按钮
+        // 阶段①：劫持剪贴板并点击复制按钮
         const btnClicked = await page.evaluate(() => {
             const items = document.querySelectorAll('[data-virtual-list-item-key]');
             if (!items.length) return false;
@@ -204,36 +253,63 @@ async function main() {
             if (!main) return false;
 
             const dsFlex = last.querySelector('.ds-flex');
-            const searchRoot = dsFlex || last; // 有 .ds-flex 就用它，否则用整个 last
+            const searchRoot = dsFlex || last;
             const divBtns = searchRoot.querySelectorAll('div[role="button"]');
             if (!divBtns.length) return false;
 
-            const copyBtn = divBtns[0];
-            const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
-            // 将捕获的文本挂到 window 上，供外部读取
+            // ★ 改进点：智能选择复制按钮
+            let copyBtn = null;
+            for (const btn of divBtns) {
+                const ariaLabel = (btn.getAttribute('aria-label') || '').trim();
+                if (/复制|copy/i.test(ariaLabel)) {
+                    copyBtn = btn;
+                    break;
+                }
+            }
+            // 回退方案：若仍未找到，使用第一个按钮（保持向后兼容）
+            if (!copyBtn) {
+                copyBtn = divBtns[0];
+            }
+            
+            // 保存原始方法，以便之后恢复
+            if (!window.__origWrite) {
+                window.__origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+            }
             window.__capturedReply = null;
             navigator.clipboard.writeText = function(text) {
                 window.__capturedReply = text;
-                return origWrite(text);
+                return window.__origWrite(text);
             };
             copyBtn.click();
             return true;
         });
 
-        if (!btnClicked) return fallbackExtract(); // 降级
+        if (!btnClicked) return fallbackExtract();
 
-        // 阶段②：等待 DeepSeek 写入剪贴板
-        await page.waitForTimeout(500);
+        // 阶段②：轮询等待剪贴板被写入（最多 2 秒）
+        await page.waitForFunction(
+            () => window.__capturedReply !== null,
+            { timeout: 2000 }
+        ).catch(() => {});  // 超时不中断，后续会降级
 
+        // 额外微小延迟，确保赋值完全结束
+        await page.waitForTimeout(100);
+
+        // 阶段③：读取捕获的文本并恢复原始剪贴板方法
         const reply = await page.evaluate(() => {
             const text = window.__capturedReply;
+            // 恢复原始 writeText，避免影响页面其他功能
+            if (window.__origWrite) {
+                navigator.clipboard.writeText = window.__origWrite;
+                delete window.__origWrite;
+            }
             delete window.__capturedReply;
             return text || '';
         });
 
         if (!reply) return fallbackExtract();
 
-        // 去除开头结尾空行 & 过滤非 AI 回复
+        // 清洗文本
         let cleaned = reply.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
         if (cleaned.includes('User:') || cleaned.includes('Assistant:')) return '';
         return cleaned;
@@ -254,6 +330,16 @@ async function main() {
         text = text.replace(/^\s*\n/, '');
         text = text.replace(/\n\s*$/, '');
         if (text.includes('User:') || text.includes('Assistant:')) return '';
+
+        // 过滤 UI 杂讯（与 sendAndWait 后处理保持一致）
+        const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c)$/i;
+        text = text
+            .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
+            .replace(/(复制|下载|运行|调试|代码)/g, '')
+            .split('\n')
+            .filter(line => !langKeywords.test(line.trim()))
+            .join('\n');
+
         return text;
     });
   }
@@ -287,14 +373,19 @@ async function main() {
   }
 
   // 带重试检测的 waitForReply
-  async function waitForReply(timeout = 300000) {
+  async function waitForReply(cancelState = null) {
     console.log('[DEBUG] 等待 AI 回复（支持重试检测）...');
     // const startTime = Date.now();
     let lastRetryCheck = 0;
 
-    // while (Date.now() - startTime < timeout) {
     while (true) {
       try {
+        // ★ 超时或其他必要取消时才会触发
+        if (cancelState && cancelState.cancelled) {
+            console.log('[DEBUG] 任务已取消，终止等待');
+            return null;
+        }
+
         // ===== 1. 优先检查是否已有完整回复（无论页面是否显示错误） =====
         const found = await page.evaluate(() => {
           const items = document.querySelectorAll('[data-virtual-list-item-key]');
@@ -358,9 +449,6 @@ async function main() {
         await page.waitForTimeout(1000);
       }
     }
-
-    console.log('[DEBUG] waitForReply 超时');
-    return null;
   }
 
   async function sendAndWait(text, cancelState = null) {
@@ -489,7 +577,7 @@ async function main() {
     }
 
     console.log('\x1b[35m[DEBUG] 进入 waitForReply\x1b[0m');
-    const reply = await waitForReply();
+    const reply = await waitForReply(cancelState);
     if (reply) {
       console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
       console.log('\x1b[32m[DEBUG] 长度:\x1b[0m', reply.length);
@@ -515,21 +603,6 @@ async function main() {
         }]
       }));
       return;
-    }
-
-    function safeJsonParse(text) {
-      // 1. 将字符串值内的真实换行替换为 \n
-      // 原理：用占位符保护字符串边界，正则匹配双引号包裹的内容
-      let safeText = text.replace(/"((?:[^"\\]|\\.)*)"/g, (match, content) => {
-        // 将内容里的真实换行、回车等转为转义形式
-        const escaped = content
-          .replace(/\n/g, '\\n')
-          .replace(/\r/g, '\\r')
-          .replace(/\t/g, '\\t');
-        return `"${escaped}"`;
-      });
-      // 还可以进一步处理未转义的英文双引号等（此处略）
-      return JSON.parse(safeText);
     }
 
     // 解析模型输出中的工具调用（新格式：<tool_call name="函数名">====== 参数名 ++++++ 参数值 </tool_call>）
@@ -713,6 +786,17 @@ async function main() {
       if (parseResult.found) {
         // 已发现工具调用标签，进行无限纠正直到解析成功
         while (true) {
+          // ★ 检查取消信号
+          if (cancelState && cancelState.cancelled) {
+              console.log('[ToolCall] 任务已取消，停止工具纠错');
+              return {
+                  toolCall: null,
+                  toolCalls: [],
+                  rawOutput: rawOutput || '',
+                  assistantContent: null
+              };
+          }
+
           if (parseResult.success) {
             // 提取工具调用标签之外的纯文本作为助手文字说明
             const textContent = rawOutput
@@ -828,8 +912,8 @@ async function main() {
       req.on('data', chunk => body += chunk);
       const cancelState = { cancelled: false, retryCount: 0 };
       req.on('close', () => {
-        cancelState.cancelled = true;
-        console.log('[HTTP] 客户端已断开连接');
+        // cancelState.cancelled = true;
+        // console.log('[HTTP] 客户端已断开连接');
       });
       const MAX_QUEUE_SIZE = 5; // 最多允许排队的请求数
       const TASK_TIMEOUT = 5 * 60 * 1000; // 单个任务总体超时 5 分钟
@@ -1018,7 +1102,6 @@ content 参数中也不能包含真实的反斜杠加 n 字符组合，如果文
 browser_evaluate 的 expression 参数报错 → 改用 function 参数
 browser_evaluate 不支持长代码 → 改用 browser_run_code_unsafe
 PowerShell 不支持 && 链式命令，需用 ; if ($?) { }
-Python 和 pip 均不在系统 PATH 中，无法运行 .py 脚本
 webfetch 可能被东方财富识别反爬 → 优先用 Playwright
 任务未完成前必须持续用工具调用，否则会中断`
               : '';
@@ -1337,6 +1420,8 @@ webfetch 可能被东方财富识别反爬 → 优先用 Playwright
 
         enqueueTask(() => Promise.race([task(), timeoutPromise]))
           .catch(e => {
+            cancelState.cancelled = true;  // 通知内部循环退出
+
             if (e.message === 'Request timeout') {
               console.error('[队列] 任务超时，已丢弃');
               if (!res.headersSent) {
