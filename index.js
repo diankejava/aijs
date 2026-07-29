@@ -203,7 +203,9 @@ async function main() {
             const main = last.querySelector('.ds-assistant-message-main-content');
             if (!main) return false;
 
-            const divBtns = last.querySelector('.ds-flex').querySelectorAll('div[role="button"]');
+            const dsFlex = last.querySelector('.ds-flex');
+            const searchRoot = dsFlex || last; // 有 .ds-flex 就用它，否则用整个 last
+            const divBtns = searchRoot.querySelectorAll('div[role="button"]');
             if (!divBtns.length) return false;
 
             const copyBtn = divBtns[0];
