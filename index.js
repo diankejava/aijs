@@ -233,7 +233,6 @@ async function main() {
       if (await warningBtns.count() > 0) {
         const btn = warningBtns.first();
         if (await btn.isVisible({ timeout: 2000 })) {
-          console.log('[重试检测] 发现重试/警告按钮（CSS类名）');
           return btn;
         }
       }
