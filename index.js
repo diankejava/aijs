@@ -835,7 +835,7 @@ async function main() {
           const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n` +
             `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
             `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
-  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。参数值中不得包含真实的换行符，必须用 \\n 替代，如果没有参数，标签里面直接空的就行，不要有分隔符。
+  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。如果没有参数，标签里面直接空的就行，不要有分隔符。
   - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
   - 注意：分隔符必须至少 6 个连续等号（======）作为参数分隔符，至少 6 个连续加号（++++++）作为键值分隔符。禁止使用少于 6 个、掺杂 ~ 或其他字符（如 ++++~~、=====、+++++++ 等都是错误的）。====== 用于分隔不同参数，++++++ 用于分隔参数名和参数值，两者不可混用。
   - 每个 <tool_call> 必须用 </tool_call> 闭合
@@ -851,7 +851,9 @@ async function main() {
     ======
     content
     ++++++
-    public class Demo {\\n        private String name = "示例";\\n    }
+    public class Demo {
+        private String name = "示例";
+    }
     ======
     </tool_call>
     多行/复杂内容示例：
@@ -863,7 +865,10 @@ async function main() {
     ======
     content
     ++++++
-    {\\n  "name": "app",\\n  "version": "1.0"\\n}
+    {
+      "name": "app",
+      "version": "1.0"
+    }
     ======
     </tool_call>
     多行/复杂内容示例：
@@ -875,12 +880,12 @@ async function main() {
     ======
     content
     ++++++
-    build:\\n\\t@echo Building...\\n\\trun: build\\n\\t@echo Running...
+    build:
+      @echo Building...
+      @run: build
+      @echo Running...
     ======
-    </tool_call>
-    【写文件/编辑文件内容格式强制要求】
-当调用 write / edit 等工具且传递 content 参数时，必须将所有换行符替换为 \\n。
-整个 content 值必须放在一行内，禁止出现真实的多行文本。`;
+    </tool_call>`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -1021,16 +1026,7 @@ async function main() {
   - 每个 <tool_call> 必须用 </tool_call> 闭合
   - 注意是tool_call，不是tool_calls
   - 编辑文本时，必须使用自带的编辑工具，不使用bash剪辑编辑。
-  - 每个 <tool_call> 块使用以下格式传递参数。**参数值中如果需要表示换行，必须写成 \\n，不得出现真实的换行符**；其他字符无需转义：
-    <tool_call name="函数名">
-    ======
-    参数名
-    ++++++
-    参数值（单行，用 \\n 表示换行）
-    ======
-    ...
-    </tool_call>
-  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。参数值中不得包含真实的换行符，必须用 \\n 替代。
+  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。
   - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
   - 简单参数示例：
     <tool_call name="read">
@@ -1057,7 +1053,9 @@ async function main() {
     ======
     content
     ++++++
-    public class Demo {\\n    private String name = "示例";\\n}
+    public class Demo {
+        private String name = "示例";
+    }
     ======
     </tool_call>
     多行/复杂内容示例：
@@ -1069,7 +1067,10 @@ async function main() {
     ======
     content
     ++++++
-    {\\n  "name": "app",\\n  "version": "1.0"\\n}
+    {
+      "name": "app",
+      "version": "1.0"
+    }
     ======
     </tool_call>
     多行/复杂内容示例：
@@ -1081,19 +1082,14 @@ async function main() {
     ======
     content
     ++++++
-    build:\\n\\t@echo Building...\\n\\trun: build\\n\\t@echo Running...
+    build:
+      @echo Building...
+      @run: build
+      @echo Running...
     ======
     </tool_call>
 可同时输出多个 <tool_call> 块。
 【注意】：参数值中请勿包含独占一行的 “======” 或 “++++++”，否则会导致解析错误。如果必须包含，请用 Base64 编码等替代方式。
-【写文件/编辑文件内容格式强制要求】
-当调用 write / edit 等工具且传递 content 参数时，必须将所有换行符替换为 \\n（两个字符：反斜杠 + 小写字母 n）。
-整个 content 值必须放在一行内，禁止出现真实的多行文本。
-content 参数中也不能包含真实的反斜杠加 n 字符组合，如果文本本身需要 \\n 请使用 \\\\n 表示。
-例如原内容为：
-  line1
-  line2
-则 content 值应为 "line1\\nline2"。
 【执行修改后必须验证】
 如果你调用了任何修改文件系统、数据库或配置的工具（如 write_file, replace_content, execute_command 等），在收到工具执行结果后，你必须紧接着调用读取或检查工具来验证修改是否成功。
 验证成功后，你可以输出简短的确认信息（如“文件已成功修改”）；如果验证失败，必须报告具体错误。
