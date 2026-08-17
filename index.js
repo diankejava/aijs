@@ -630,10 +630,10 @@ async function main() {
       const parseKeyValueArgs = (text) => {
         const args = {};
         // 容错：强制分隔符独占一行
-        text = text.replace(/([^\n=])(={4,})/g, '$1\n$2');
-        text = text.replace(/([^\n+])(\+{4,})/g, '$1\n$2');
-        text = text.replace(/(={4,})([^\n=])/g, '$1\n$2');
-        text = text.replace(/(\+{4,})([^\n+])/g, '$1\n$2');
+        text = text.replace(/([^\n=])(={4,})(?![~\n])/g, '$1\n$2');
+        text = text.replace(/([^\n+])(\+{4,})(?![~\n])/g, '$1\n$2');
+        text = text.replace(/(={4,})(?![~\n])([^\n=])/g, '$1\n$2');
+        text = text.replace(/(\+{4,})(?![~\n])([^\n+])/g, '$1\n$2');
         const lines = text.split('\n');
         let currentKey = null;
         let currentValueLines = [];
@@ -753,7 +753,21 @@ async function main() {
 
       if (results.length === 0) {
         if (/<(tool_calls|invoke|parameter|function_call|tool_use)/i.test(text)) {
-          return { found: true, success: false, toolCalls: [], toolCall: null, error: '检测到禁止的标签格式，必须使用 <tool_call name="函数名">====== ... ++++++ ... </tool_call>' };
+          // 动态提取实际出现的禁止标签，让错误信息更具体
+          const forbiddenTags = ['tool_calls', 'invoke', 'parameter', 'function_call', 'tool_use'];
+          const foundTags = forbiddenTags.filter(tag => 
+            text.includes(`<${tag}`) || text.includes(`&lt;${tag}`)
+          );
+          const tagList = foundTags.length > 0 
+            ? foundTags.map(t => `<${t}>`).join(', ') 
+            : '未知禁止标签';
+          return { 
+            found: true, 
+            success: false, 
+            toolCalls: [], 
+            toolCall: null, 
+            error: `检测到禁止的标签格式：${tagList}，必须使用 <tool_call name="函数名">====== ... ++++++ ... </tool_call>` 
+          };
         }
         if (text.includes('<tool_call') || text.includes('&lt;tool_call')) {
           return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <tool_call> 标签但无法解析，必须使用 ====== / ++++++ 分隔参数' };
@@ -831,61 +845,26 @@ async function main() {
           if (failedMatch) {
             const failedText = failedMatch[1].trim();
             fixExample = `\n  【你的错误输出】：${failedText.slice(0, 200)}`;
+          } else if (parseResult.error.includes('禁止的标签格式')) {
+            // 当错误是禁止标签时，展示原始输出片段，让模型看到自己错在哪里
+            fixExample = `\n  【你的错误输出片段】：${rawOutput.slice(0, 200)}`;
           }
           const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n` +
             `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
-            `【请按以下格式输出工具调用，整个回复只能包含工具调用标签】
-  - 每个参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。如果没有参数，标签里面直接空的就行，不要有分隔符。
-  - 重要：每个 “======” 和 “++++++” 必须独占一行，前后必须有换行。不能写成 ======pattern++++++value 这种紧凑形式！
-  - 注意：分隔符必须至少 6 个连续等号（======）作为参数分隔符，至少 6 个连续加号（++++++）作为键值分隔符。禁止使用少于 6 个、掺杂 ~ 或其他字符（如 ++++~~、=====、+++++++ 等都是错误的）。====== 用于分隔不同参数，++++++ 用于分隔参数名和参数值，两者不可混用。
-  - 每个 <tool_call> 必须用 </tool_call> 闭合
-  - 注意是tool_call不是tool_calls
-  - 绝对禁止使用 <parameter> 标签！不要使用 <parameter name="xxx">value</parameter> 这种格式！
-  - 编辑文本时，必须使用自带的编辑工具，不使用bash剪辑编辑。
-  - 正确示例：
-    <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\project\\Demo.java
-    ======
-    content
-    ++++++
-    public class Demo {
-        private String name = "示例";
-    }
-    ======
-    </tool_call>
-    多行/复杂内容示例：
-    <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\project\\config.json
-    ======
-    content
-    ++++++
-    {
-      "name": "app",
-      "version": "1.0"
-    }
-    ======
-    </tool_call>
-    多行/复杂内容示例：
-    <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\project\\Makefile
-    ======
-    content
-    ++++++
-    build:
-      @echo Building...
-      @run: build
-      @echo Running...
-    ======
-    </tool_call>`;
+            `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
+    `你现在必须使用以下自定义格式调用工具，绝对禁止使用任何其他格式。\n\n` +
+    `✅ 正确格式（唯一允许）：\n` +
+    `<tool_call name="工具名">\n` +
+    `======\n` +
+    `参数名1\n` +
+    `++++++\n` +
+    `参数值1\n` +
+    `======\n` +
+    `参数名2\n` +
+    `++++++\n` +
+    `参数值2\n` +
+    `======\n` +
+    `</tool_call>\n`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -1022,101 +1001,31 @@ async function main() {
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
             const toolCallInstructions = tools.length > 0
-              ? `【关键工具调用规则 - 必须严格遵守，不允许任何偏差】
-  - 每个 <tool_call> 必须用 </tool_call> 闭合
-  - 注意是tool_call，不是tool_calls
-  - 编辑文本时，必须使用自带的编辑工具，不使用bash剪辑编辑。
-  - 每条参数以独占一行的 “======” 开始，下一行是参数名，再下一行是独占一行的 “++++++”，紧接着下一行就是参数值。
-  - 注意：分隔符必须是恰好 6 个等号（======）和 6 个加号（++++++），不能多也不能少。
-  - 简单参数示例：
-    <tool_call name="read">
-    ======
-    filePath
-    ++++++
-    E:\\boot\\UserImsIceMapper.xml
-    ======
-    offset
-    ++++++
-    10
-    ======
-    limit
-    ++++++
-    20
-    ======
-    </tool_call>
-  - 多行/复杂内容示例：
-    <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\project\\Demo.java
-    ======
-    content
-    ++++++
-    public class Demo {
-        private String name = "示例";
-    }
-    ======
-    </tool_call>
-    多行/复杂内容示例：
-    <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\project\\config.json
-    ======
-    content
-    ++++++
-    {
-      "name": "app",
-      "version": "1.0"
-    }
-    ======
-    </tool_call>
-    多行/复杂内容示例：
-    <tool_call name="write">
-    ======
-    filePath
-    ++++++
-    E:\\project\\Makefile
-    ======
-    content
-    ++++++
-    build:
-      @echo Building...
-      @run: build
-      @echo Running...
-    ======
-    </tool_call>
-可同时输出多个 <tool_call> 块。
-【注意】：参数值中请勿包含独占一行的 “======” 或 “++++++”，否则会导致解析错误。如果必须包含，请用 Base64 编码等替代方式。
-【执行修改后必须验证】
-如果你调用了任何修改文件系统、数据库或配置的工具（如 write_file, replace_content, execute_command 等），在收到工具执行结果后，你必须紧接着调用读取或检查工具来验证修改是否成功。
-验证成功后，你可以输出简短的确认信息（如“文件已成功修改”）；如果验证失败，必须报告具体错误。
-【绝对禁止的格式】
-禁止使用 JSON 格式。
-禁止使用 <parameter> 标签传递参数，必须使用 ======/++++++ 分隔。
-禁止使用 <tool_calls> 等其他标签。
-如果不需要工具，直接回复文本。
-【普通回复规则】
-如果当前回复不需要调用任何工具，请直接输出纯文本回答，绝对禁止出现以下任何内容：
-- <tool_call> 或 </tool_call> 标签
-- 独占一行的 "======" 或 "++++++"
-- 任何形式的参数分隔符
-普通回复中不应包含上述任何特殊符号，否则会导致解析错误。
-[Playwright 工具使用经验 - 已验证有效流程]
-步骤1: browser_navigate 直接访问目标数据API的URL，并携带必要的查询参数。
-步骤2: browser_run_code_unsafe 执行复杂的JS逻辑（如异步数据处理、多步骤操作等），这是唯一能运行较长JS代码的方式。
-步骤3: browser_evaluate 仅用于简单查询（如提取页面元素或返回简单值），避免使用复杂箭头函数或async，否则可能触发语法错误。
-步骤4: 在连续请求之间加入适当的休眠间隔，避免请求频率过高触发限制。
-[关键踩坑记录]
-browser_evaluate 的 expression 参数报错 → 改用 function 参数
-browser_evaluate 不支持长代码 → 改用 browser_run_code_unsafe
-PowerShell 不支持 && 链式命令，需用 ; if ($?) { }
-webfetch 可能被东方财富识别反爬 → 优先用 Playwright
-任务未完成前必须持续用工具调用，否则会中断`
-              : '';
-
+  ? `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
+    `你现在必须使用以下自定义格式调用工具，绝对禁止使用任何其他格式。\n\n` +
+    `✅ 正确格式（唯一允许）：\n` +
+    `<tool_call name="工具名">\n` +
+    `======\n` +
+    `参数名1\n` +
+    `++++++\n` +
+    `参数值1\n` +
+    `======\n` +
+    `参数名2\n` +
+    `++++++\n` +
+    `参数值2\n` +
+    `======\n` +
+    `</tool_call>\n\n` +
+    `❌ 错误格式（绝对禁止，会导致解析失败）：\n` +
+    `<tool_calls>\n` +
+    `<invoke name="glob">\n` +
+    `<parameter name="pattern">**/*.vue</parameter>\n` +
+    `</invoke>\n` +
+    `</tool_calls>\n\n` +
+    `禁止使用 <tool_calls>、<invoke>、<parameter> 这些标签！\n` +
+    `禁止使用 JSON 格式！\n` +
+    `分隔符必须是独占一行的 6 个等号（======）和 6 个加号（++++++）。\n\n` +
+    `如果你输出了错误格式，系统将无法解析，必须重新输出正确格式。\n`
+  : '';
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
               promptText, toolsText, toolCallInstructions, toolNames, cancelState
             );
