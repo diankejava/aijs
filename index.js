@@ -849,9 +849,7 @@ async function main() {
             // 当错误是禁止标签时，展示原始输出片段，让模型看到自己错在哪里
             fixExample = `\n  【你的错误输出片段】：${rawOutput.slice(0, 200)}`;
           }
-          const retryPrompt = `${promptText}\n\n【工具格式纠正请求 - 必须使用“====== / ++++++”分隔参数】\n` +
-            `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
-            `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
+          const retryPrompt = `!!!最高优先级指令：工具调用格式!!!】\n` +
     `你现在必须使用以下自定义格式调用工具，绝对禁止使用任何其他格式。\n\n` +
     `✅ 正确格式（唯一允许）：\n` +
     `<tool_call name="工具名">\n` +
