@@ -240,107 +240,58 @@ async function main() {
     return null;
   }
 
-  // 提取最后一条 AI 回复（公共函数，消除重复代码）
+  // 提取最后一条 AI 回复（不依赖剪贴板，直接用 textContent 保留缩进与换行）
   async function extractLastReply() {
     try {
-        // 阶段①：劫持剪贴板并点击复制按钮
-        const btnClicked = await page.evaluate(() => {
+        return await page.evaluate(() => {
             const items = document.querySelectorAll('[data-virtual-list-item-key]');
-            if (!items.length) return false;
+            if (!items.length) return '';
             const last = items[items.length - 1];
             const main = last.querySelector('.ds-assistant-message-main-content');
-            if (!main) return false;
+            if (!main) return '';
 
-            const dsFlex = last.querySelector('.ds-flex');
-            const searchRoot = dsFlex || last;
-            const divBtns = searchRoot.querySelectorAll('div[role="button"]');
-            if (!divBtns.length) return false;
-
-            // ★ 改进点：智能选择复制按钮
-            let copyBtn = null;
-            for (const btn of divBtns) {
-                const ariaLabel = (btn.getAttribute('aria-label') || '').trim();
-                if (/复制|copy/i.test(ariaLabel)) {
-                    copyBtn = btn;
-                    break;
+            // 遍历 DOM：文本节点取原文（保留缩进/内联换行），块级元素之后补一个换行
+            const BLOCK = new Set(['P', 'DIV', 'PRE', 'UL', 'OL', 'LI', 'TABLE', 'TR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'BR', 'HR']);
+            const walk = (node) => {
+                let out = '';
+                for (const c of node.childNodes) {
+                    if (c.nodeType === 3) {
+                        out += c.textContent;
+                    } else if (c.nodeType === 1) {
+                        out += walk(c);
+                        if (BLOCK.has(c.tagName)) out += '\n';
+                    }
                 }
-            }
-            // 回退方案：若仍未找到，使用第一个按钮（保持向后兼容）
-            if (!copyBtn) {
-                copyBtn = divBtns[0];
-            }
-            
-            // 保存原始方法，以便之后恢复
-            if (!window.__origWrite) {
-                window.__origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
-            }
-            window.__capturedReply = null;
-            navigator.clipboard.writeText = function(text) {
-                window.__capturedReply = text;
-                return window.__origWrite(text);
+                return out;
             };
-            copyBtn.click();
-            return true;
-        });
 
-        if (!btnClicked) return fallbackExtract();
+            let text = walk(main).replace(/\n{3,}/g, '\n\n').trim();
 
-        // 阶段②：轮询等待剪贴板被写入（最多 2 秒）
-        await page.waitForFunction(
-            () => window.__capturedReply !== null,
-            { timeout: 2000 }
-        ).catch(() => {});  // 超时不中断，后续会降级
-
-        // 额外微小延迟，确保赋值完全结束
-        await page.waitForTimeout(100);
-
-        // 阶段③：读取捕获的文本并恢复原始剪贴板方法
-        const reply = await page.evaluate(() => {
-            const text = window.__capturedReply;
-            // 恢复原始 writeText，避免影响页面其他功能
-            if (window.__origWrite) {
-                navigator.clipboard.writeText = window.__origWrite;
-                delete window.__origWrite;
+            // 降级：walk（textContent）提取为空时，回退用 innerText（渲染文本）兜底
+            if (!text) {
+                text = (main.innerText || '').trim();
             }
-            delete window.__capturedReply;
-            return text || '';
+
+            // 只拦截行首的英文对话历史标记（如 "User: xxx"），避免误伤代码里的 DeptUser::getSn 等双冒号方法引用
+            if (/^(User|Assistant)\s*:/m.test(text)) return '';
+
+            // 过滤 UI 杂讯：语言标签、代码块操作按钮（仅当独占一行时删除，避免误删正文）
+            const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c)$/i;
+            const uiNoise = /^(复制|下载|运行|调试|代码)$/;
+            text = text
+                .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
+                .split('\n')
+                .filter(line => {
+                    const t = line.trim();
+                    return t !== '' && !langKeywords.test(t) && !uiNoise.test(t);
+                })
+                .join('\n');
+
+            return text;
         });
-
-        if (!reply) return fallbackExtract();
-
-        // 清洗文本
-        let cleaned = reply.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
-        if (cleaned.includes('User:') || cleaned.includes('Assistant:')) return '';
-        return cleaned;
-
     } catch (e) {
-        return fallbackExtract();
+        return '';
     }
-  }
-  // 降级方案：innerText
-  async function fallbackExtract() {
-    return await page.evaluate(() => {
-        const items = document.querySelectorAll('[data-virtual-list-item-key]');
-        if (!items.length) return '';
-        const last = items[items.length - 1];
-        const main = last.querySelector('.ds-assistant-message-main-content');
-        if (!main) return '';
-        let text = main.innerText;
-        text = text.replace(/^\s*\n/, '');
-        text = text.replace(/\n\s*$/, '');
-        if (text.includes('User:') || text.includes('Assistant:')) return '';
-
-        // 过滤 UI 杂讯（与 sendAndWait 后处理保持一致）
-        const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c)$/i;
-        text = text
-            .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-            .replace(/(复制|下载|运行|调试|代码)/g, '')
-            .split('\n')
-            .filter(line => !langKeywords.test(line.trim()))
-            .join('\n');
-
-        return text;
-    });
   }
 
   // 检测错误文本（限制搜索范围为 Toast/通知区域，避免误判 AI 回复内容）
@@ -376,6 +327,7 @@ async function main() {
     console.log('[DEBUG] 等待 AI 回复（支持重试检测）...');
     // const startTime = Date.now();
     let lastRetryCheck = 0;
+    let emptyReplyCount = 0; // 连续"正文为空"计数，防止死循环
 
     while (true) {
       try {
@@ -390,7 +342,12 @@ async function main() {
           const items = document.querySelectorAll('[data-virtual-list-item-key]');
           if (!items.length) return false;
           const last = items[items.length - 1];
-          return !!(last.querySelector('.ds-assistant-message-main-content') && last.querySelector('.ds-flex'));
+          const main = last.querySelector('.ds-assistant-message-main-content');
+          const flex = last.querySelector('.ds-flex');
+          // 要求正文容器存在、操作栏出现、且正文非空。
+          // 否则深度思考（R1）时容器已建但正文未输出，会被过早判定为完成。
+          // 用 textContent 判断（与 extractLastReply 的 walk 基于同一数据源），避免两者不一致导致死循环。
+          return !!(main && flex && main.textContent && main.textContent.trim());
         });
 
         // 2. 检查发送按钮是否已经恢复为非停止状态
@@ -420,8 +377,52 @@ async function main() {
             reply = await extractLastReply();
           }
 
-          console.log('[DEBUG] 成功提取回复，长度:', reply ? reply.length : 0);
-          return reply || '';
+          if (reply) {
+            console.log('[DEBUG] 成功提取回复，长度:', reply.length);
+            return reply;
+          }
+
+          // 完成信号已出现但正文仍为空（深度思考/正文尚未输出完），继续等待而非直接返回空
+          emptyReplyCount++;
+          console.log(`[DEBUG] 完成信号已出现但正文为空 (${emptyReplyCount}/20)，继续等待正文输出...`);
+
+          // 诊断：输出 main 的 innerText/textContent，帮助定位提取失败原因
+          try {
+            const diag = await page.evaluate(() => {
+              const items = document.querySelectorAll('[data-virtual-list-item-key]');
+              if (!items.length) return { items: 0 };
+              const last = items[items.length - 1];
+              const main = last.querySelector('.ds-assistant-message-main-content');
+              return {
+                items: items.length,
+                hasMain: !!main,
+                innerText: main ? (main.innerText || '').slice(0, 120) : '',
+                textContent: main ? (main.textContent || '').slice(0, 120) : '',
+              };
+            });
+            console.log('[DEBUG][诊断]', JSON.stringify(diag));
+          } catch (e) {}
+
+          // 超过上限：降级用 innerText 直接返回，避免死循环
+          if (emptyReplyCount >= 20) {
+            console.log('[DEBUG] 连续正文为空超过上限，降级用 innerText 提取...');
+            const fallback = await page.evaluate(() => {
+              const items = document.querySelectorAll('[data-virtual-list-item-key]');
+              if (!items.length) return '';
+              const last = items[items.length - 1];
+              const main = last.querySelector('.ds-assistant-message-main-content');
+              return main ? (main.innerText || '').trim() : '';
+            });
+            if (fallback) {
+              console.log('[DEBUG] 降级提取成功，长度:', fallback.length);
+              return fallback;
+            }
+            console.log('[DEBUG] 降级提取也为空，放弃等待');
+            return '';
+          }
+
+          await page.waitForTimeout(1500);
+          continue;
         }
 
         // ===== 2. 没有完成信号时才进行重试/错误处理（降低检查频率） =====
@@ -620,88 +621,18 @@ async function main() {
       return;
     }
 
-    // 解析模型输出中的工具调用（新格式：<tool_call name="函数名">====== 参数名 ++++++ 参数值 </tool_call>）
+    // 解析模型输出中的工具调用（格式：<invoke name="函数名"><parameter name="参数名">参数值</parameter></invoke>）
     function parseToolCall(text, allowedNames = []) {
       if (!text) return { found: false, success: false, toolCalls: [], toolCall: null };
 
       const results = [];
 
-      // 支持用任意数量的 = 或 + 组成的独立行作为分隔符
-      const parseKeyValueArgs = (text) => {
-        const args = {};
-        // 容错：强制分隔符独占一行
-        text = text.replace(/([^\n=])(={4,})(?![~\n])/g, '$1\n$2');
-        text = text.replace(/([^\n+])(\+{4,})(?![~\n])/g, '$1\n$2');
-        text = text.replace(/(={4,})(?![~\n])([^\n=])/g, '$1\n$2');
-        text = text.replace(/(\+{4,})(?![~\n])([^\n+])/g, '$1\n$2');
-        const lines = text.split('\n');
-        let currentKey = null;
-        let currentValueLines = [];
-
-        const flush = () => {
-          if (currentKey) {
-            // 保留开头空白，只去除末尾连续的空行
-            let value = currentValueLines.join('\n').replace(/\n+$/, '');
-
-            // 对内容型参数，将字面量 \n 还原为真实换行符
-            const contentKeys = ['content', 'text', 'code', 'body', 'source', 'data'];
-            if (contentKeys.includes(currentKey)) {
-              value = value.replace(/\\n/g, '\n').replace(/\\\\/g, '\\');
-            }
-
-            // 智能类型转换：纯数字字符串自动转 Number（内容型参数除外）
-            if (!contentKeys.includes(currentKey)) {
-              const cleanedValue = value.replace(/\s+/g, '');
-              const numVal = Number(cleanedValue);
-              if (cleanedValue !== '' && !isNaN(numVal) && String(numVal) === cleanedValue) {
-                args[currentKey] = numVal;
-                currentKey = null;
-                currentValueLines = [];
-                return;
-              }
-            }
-
-            args[currentKey] = value;
-            currentKey = null;
-            currentValueLines = [];
-          }
-        };
-
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          const trimmed = line.trim();
-
-          // ★ 添加空行跳过逻辑
-          if (trimmed === '' && currentKey === null) {
-            continue;
-          }
-
-          if (/^={4,}/.test(trimmed)) {
-            flush();
-            continue;
-          }
-          if (/^\+{4,}/.test(trimmed)) {
-            continue;
-          }
-
-          if (!currentKey) {
-            currentKey = trimmed.replace(/\s+/g, '');
-          } else {
-            currentValueLines.push(line);
-          }
-        }
-        flush(); // 处理最后一个参数
-        return Object.keys(args).length > 0 ? args : null;
-      };
-
-      // 清理 <tool_call name="... "> 中引号与 > 之间的换行/空格，防止解析失败
-      text = text.replace(/(<tool_call\s+name\s*=\s*")([^"]*)("\s*)(>)/gi, (m, p1, name, p3, p4) => p1 + name.trim() + '">');
-      // 正则匹配完整的 <tool_call name="函数名"> ... </tool_call>（支持换行）
-      const toolCallRegex = /<tool_call\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/tool_call>/gi;
+      // 正则匹配完整的 <invoke name="函数名"> ... </invoke>（支持换行、多个参数）
+      const invokeRegex = /<invoke\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/invoke>/gi;
       let match;
-      while ((match = toolCallRegex.exec(text)) !== null) {
+      while ((match = invokeRegex.exec(text)) !== null) {
         const rawName = match[1].trim();
-        const rawArgs = match[2].trim();
+        const rawBody = match[2];
 
         if (!rawName) {
           results.push({ success: false, error: 'name 属性不能为空' });
@@ -716,61 +647,72 @@ async function main() {
           continue;
         }
 
-        // ★ 新增：处理无参数的工具调用
-        if (rawArgs === '') {
+        // 无参数的工具调用
+        if (rawBody.trim() === '') {
           results.push({ success: true, toolCall: { name: rawName, arguments: {} } });
           continue;
         }
 
-        // 直接使用原始参数文本，仅确保首尾有换行（innerText 已提供正确换行）
-        let fixedArgs = '\n' + rawArgs.trim() + '\n';
-        const parsedArgs = parseKeyValueArgs(fixedArgs);
-        if (!parsedArgs) {
-          console.log('[ToolCall] 失败的参数文本：', rawArgs);
-          results.push({ success: false, error: `参数格式错误，请使用 ====== / ++++++ 分隔格式，失败的参数文本：${rawArgs.slice(0, 100)}` });
-        } else {
-          // 额外校验：只保留合法的参数名，并丢弃完全无效的键
-          const validArgs = {};
-          let hasInvalidKey = false;
-          for (const [k, v] of Object.entries(parsedArgs)) {
-            if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(k)) {
-              validArgs[k] = v;
-            } else {
-              console.log('[ToolCall] 忽略非法参数名:', k);
-              hasInvalidKey = true;
-            }
-          }
-          if (Object.keys(validArgs).length === 0) {
-            results.push({ success: false, error: `参数格式错误，未提取到有效参数名，失败的参数文本：${rawArgs.slice(0, 100)}` });
+        // 解析 <parameter name="参数名">参数值</parameter>
+        const args = {};
+        const paramRegex = /<parameter\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/parameter>/gi;
+        let pm;
+        while ((pm = paramRegex.exec(rawBody)) !== null) {
+          const pName = pm[1].trim();
+          const pValue = pm[2].trim();
+
+          // 智能类型转换：纯数字字符串自动转 Number（offset/limit 等）
+          const cleanedValue = pValue.replace(/\s+/g, '');
+          const numVal = Number(cleanedValue);
+          if (cleanedValue !== '' && !isNaN(numVal) && String(numVal) === cleanedValue) {
+            args[pName] = numVal;
           } else {
-            if (hasInvalidKey) {
-              console.log('[ToolCall] 部分参数被忽略，已提取的有效参数:', JSON.stringify(validArgs));
-            }
-            results.push({ success: true, toolCall: { name: rawName, arguments: validArgs } });
+            args[pName] = pValue;
           }
+        }
+
+        // 只保留合法的参数名，丢弃无效键
+        const validArgs = {};
+        let hasInvalidKey = false;
+        for (const [k, v] of Object.entries(args)) {
+          if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(k)) {
+            validArgs[k] = v;
+          } else {
+            console.log('[ToolCall] 忽略非法参数名:', k);
+            hasInvalidKey = true;
+          }
+        }
+
+        if (Object.keys(validArgs).length === 0) {
+          results.push({ success: false, error: `参数格式错误，未提取到有效参数，失败的参数文本：${rawBody.slice(0, 100)}` });
+        } else {
+          if (hasInvalidKey) {
+            console.log('[ToolCall] 部分参数被忽略，已提取的有效参数:', JSON.stringify(validArgs));
+          }
+          results.push({ success: true, toolCall: { name: rawName, arguments: validArgs } });
         }
       }
 
       if (results.length === 0) {
-        if (/<(tool_calls|invoke|parameter|function_call|tool_use)/i.test(text)) {
-          // 动态提取实际出现的禁止标签，让错误信息更具体
-          const forbiddenTags = ['tool_calls', 'invoke', 'parameter', 'function_call', 'tool_use'];
-          const foundTags = forbiddenTags.filter(tag => 
+        if (/<(tool_call|tool_calls|function_call|tool_use)/i.test(text)) {
+          // 检测到旧格式标签，提示改用新格式
+          const oldTags = ['tool_call', 'tool_calls', 'function_call', 'tool_use'];
+          const foundTags = oldTags.filter(tag =>
             text.includes(`<${tag}`) || text.includes(`&lt;${tag}`)
           );
-          const tagList = foundTags.length > 0 
-            ? foundTags.map(t => `<${t}>`).join(', ') 
-            : '未知禁止标签';
-          return { 
-            found: true, 
-            success: false, 
-            toolCalls: [], 
-            toolCall: null, 
-            error: `检测到禁止的标签格式：${tagList}，必须使用 <tool_call name="函数名">====== ... ++++++ ... </tool_call>` 
+          const tagList = foundTags.length > 0
+            ? foundTags.map(t => `<${t}>`).join(', ')
+            : '旧格式标签';
+          return {
+            found: true,
+            success: false,
+            toolCalls: [],
+            toolCall: null,
+            error: `检测到旧格式标签：${tagList}，必须使用 <invoke name="函数名"> + <parameter name="参数名">参数值</parameter> 格式`
           };
         }
-        if (text.includes('<tool_call') || text.includes('&lt;tool_call')) {
-          return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <tool_call> 标签但无法解析，必须使用 ====== / ++++++ 分隔参数' };
+        if (text.includes('<invoke') || text.includes('&lt;invoke')) {
+          return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <invoke> 标签但无法解析，请使用 <parameter name="参数名">参数值</parameter> 包裹参数' };
         }
         return { found: false, success: false, toolCalls: [], toolCall: null };
       }
@@ -829,7 +771,7 @@ async function main() {
           if (parseResult.success) {
             // 提取工具调用标签之外的纯文本作为助手文字说明
             const textContent = rawOutput
-              .replace(/<tool_call[\s\S]*?<\/tool_call>/g, '')  // 移除所有 tool_call 块
+              .replace(/<invoke[\s\S]*?<\/invoke>/g, '')  // 移除所有 invoke 块
               .replace(/\n{3,}/g, '\n\n')                         // 压缩多余空行
               .trim();
             return {
@@ -849,20 +791,14 @@ async function main() {
             // 当错误是禁止标签时，展示原始输出片段，让模型看到自己错在哪里
             fixExample = `\n  【你的错误输出片段】：${rawOutput.slice(0, 200)}`;
           }
-          const retryPrompt = `!!!最高优先级指令：工具调用格式!!!】\n` +
-    `你现在必须使用以下自定义格式调用工具，绝对禁止使用任何其他格式。\n\n` +
+          const retryPrompt = `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
+            `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
+    `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
     `✅ 正确格式（唯一允许）：\n` +
-    `<tool_call name="工具名">\n` +
-    `======\n` +
-    `参数名1\n` +
-    `++++++\n` +
-    `参数值1\n` +
-    `======\n` +
-    `参数名2\n` +
-    `++++++\n` +
-    `参数值2\n` +
-    `======\n` +
-    `</tool_call>\n`;
+    `<invoke name="工具名">\n` +
+    `<parameter name="参数名1">参数值1</parameter>\n` +
+    `<parameter name="参数名2">参数值2</parameter>\n` +
+    `</invoke>\n`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -1000,29 +936,18 @@ async function main() {
               : '无';
             const toolCallInstructions = tools.length > 0
   ? `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
-    `你现在必须使用以下自定义格式调用工具，绝对禁止使用任何其他格式。\n\n` +
+    `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
     `✅ 正确格式（唯一允许）：\n` +
-    `<tool_call name="工具名">\n` +
-    `======\n` +
-    `参数名1\n` +
-    `++++++\n` +
-    `参数值1\n` +
-    `======\n` +
-    `参数名2\n` +
-    `++++++\n` +
-    `参数值2\n` +
-    `======\n` +
-    `</tool_call>\n\n` +
-    `❌ 错误格式（绝对禁止，会导致解析失败）：\n` +
-    `<tool_calls>\n` +
-    `<invoke name="glob">\n` +
-    `<parameter name="pattern">**/*.vue</parameter>\n` +
-    `</invoke>\n` +
-    `</tool_calls>\n\n` +
-    `禁止使用 <tool_calls>、<invoke>、<parameter> 这些标签！\n` +
-    `禁止使用 JSON 格式！\n` +
-    `分隔符必须是独占一行的 6 个等号（======）和 6 个加号（++++++）。\n\n` +
-    `如果你输出了错误格式，系统将无法解析，必须重新输出正确格式。\n`
+    `<invoke name="工具名">\n` +
+    `<parameter name="参数名1">参数值1</parameter>\n` +
+    `<parameter name="参数名2">参数值2</parameter>\n` +
+    `</invoke>\n\n` +
+    `示例（调用 read 工具）：\n` +
+    `<invoke name="read">\n` +
+    `<parameter name="filePath">E:\\path\\to\\file.java</parameter>\n` +
+    `<parameter name="offset">120</parameter>\n` +
+    `<parameter name="limit">95</parameter>\n` +
+    `</invoke>\n`
   : '';
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
               promptText, toolsText, toolCallInstructions, toolNames, cancelState
