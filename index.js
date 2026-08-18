@@ -58,6 +58,8 @@ async function main() {
   let isRestarting = false;
   let consecutiveRestarts = 0;
   const MAX_RESTARTS = 5; // 连续崩溃次数上限
+  let sseDeltaHandler = null; // 当前 SSE 增量处理器（流式接收用）
+  let sseRequestSeq = 0; // completion 请求计数（诊断用，判断是否分多请求输出）
 
   // 封装登录等待逻辑（原代码中的循环部分）
   async function waitForLogin(page) {
@@ -179,6 +181,51 @@ async function main() {
 
     await waitForLogin(newPage);
     console.log('登录成功！可以开始对话了。\n');
+
+    // 注入 SSE 流式拦截：把 completion 响应的增量实时推给 Node（用于流式返回）
+    await newPage.exposeFunction('__onSSEDelta', (chunk) => {
+      if (sseDeltaHandler) sseDeltaHandler(chunk);
+    });
+    await newPage.exposeFunction('__onSSERequest', () => {
+      sseRequestSeq++;
+      console.log('[SSE] 新的 completion 请求 #' + sseRequestSeq + '（判断是否分多请求输出）');
+    });
+    await newPage.evaluate(() => {
+      if (window.__sseInjected) return;
+      window.__sseInjected = true;
+      // DeepSeek 用 XHR 发送 completion 请求，拦截 XHR 实时读取 SSE 增量
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__url = url;
+        return origOpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(...args) {
+        if (this.__url && String(this.__url).includes('/api/v0/chat/completion')) {
+          if (window.__onSSERequest) window.__onSSERequest();
+          let lastLen = 0;
+          const flush = () => {
+            try {
+              const text = this.responseText || '';
+              if (text.length > lastLen) {
+                const delta = text.slice(lastLen);
+                lastLen = text.length;
+                if (window.__onSSEDelta) window.__onSSEDelta(delta);
+              }
+            } catch (e) {}
+          };
+          // progress 事件的 responseText 可能滞后，用 load/loadend 兜底，确保最后一段数据不丢
+          this.addEventListener('progress', flush);
+          this.addEventListener('load', flush);
+          this.addEventListener('loadend', () => {
+            flush();
+            // 强制补一个换行，把解析器 buffer 里的最后一行（FINISHED 信号）刷出来
+            if (window.__onSSEDelta) window.__onSSEDelta('\n');
+          });
+        }
+        return origSend.call(this, ...args);
+      };
+    });
 
     return { browser: newBrowser, page: newPage };
   }
@@ -467,7 +514,129 @@ async function main() {
     }
   }
 
-  async function sendAndWait(text, cancelState = null) {
+  // 解析 DeepSeek SSE 响应，提取 RESPONSE（正文）的完整原始文本
+  function parseSSE(body) {
+    let lastPath = '';
+    let lastOp = '';
+    let inResponse = false;
+    let content = '';
+
+    const lines = body.split('\n');
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const dataStr = line.slice(5).trim();
+      if (!dataStr.startsWith('{')) continue;
+      let d;
+      try { d = JSON.parse(dataStr); } catch (e) { continue; }
+
+      if (d.p) lastPath = d.p;
+      if (d.o) lastOp = d.o;
+
+      // 追加新 fragment（RESPONSE 为正文）
+      if (lastPath === 'response/fragments' && lastOp === 'APPEND' && Array.isArray(d.v)) {
+        for (const f of d.v) {
+          if (f && f.type === 'RESPONSE') {
+            inResponse = true;
+            if (typeof f.content === 'string') content += f.content;
+          }
+        }
+        continue;
+      }
+
+      // 流式累积正文 content（-1 指向当前最后一个 fragment）
+      if (lastPath === 'response/fragments/-1/content' && inResponse) {
+        if (typeof d.v === 'string') content += d.v;
+        continue;
+      }
+    }
+
+    return content;
+  }
+
+  // 流式 SSE 解析器：处理增量 chunk，实时提取 RESPONSE（正文）增量；RESPONSE 空时用 THINK 兜底
+  function createSSEParser(onResponseDelta, onFinished) {
+    let buffer = '';
+    let lastPath = '';
+    let lastOp = '';
+    let currentFragmentType = null; // 未知，由初始 response 对象或 APPEND 的 type 字段决定
+    let thinkContent = '';
+    let responseContent = '';
+
+    return (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // 保留最后一个不完整行
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        const dataStr = line.slice(5).trim();
+        if (!dataStr.startsWith('{')) continue;
+        let d;
+        try { d = JSON.parse(dataStr); } catch (e) { continue; }
+
+        // 处理初始 response 对象：从 fragments 数组判断 fragment 类型（THINK 还是 RESPONSE）
+        if (d.v && d.v.response && Array.isArray(d.v.response.fragments)) {
+          for (const f of d.v.response.fragments) {
+            if (!f || typeof f.type !== 'string') continue;
+            currentFragmentType = f.type;
+            if (f.type === 'RESPONSE' && typeof f.content === 'string') {
+              responseContent += f.content;
+              onResponseDelta(f.content);
+            } else if (f.type === 'THINK' && typeof f.content === 'string') {
+              thinkContent += f.content;
+            }
+          }
+          continue;
+        }
+
+        if (d.p) lastPath = d.p;
+        if (d.o) lastOp = d.o;
+
+        // 追加新 fragment
+        if (lastPath === 'response/fragments' && lastOp === 'APPEND' && Array.isArray(d.v)) {
+          for (const f of d.v) {
+            if (f && f.type === 'RESPONSE') {
+              if (currentFragmentType !== 'RESPONSE') console.log('[SSE] 检测到 RESPONSE fragment');
+              currentFragmentType = 'RESPONSE';
+              if (typeof f.content === 'string') {
+                responseContent += f.content;
+                onResponseDelta(f.content);
+              }
+            } else if (f && f.type === 'THINK') {
+              currentFragmentType = 'THINK';
+              if (typeof f.content === 'string') thinkContent += f.content;
+            }
+          }
+          continue;
+        }
+
+        // 流式累积 content（-1 指向当前 fragment）
+        if (lastPath === 'response/fragments/-1/content') {
+          if (typeof d.v === 'string') {
+            if (currentFragmentType === 'THINK') {
+              thinkContent += d.v;
+            } else {
+              // RESPONSE 或未知类型：默认按正文处理，避免误判为思考
+              responseContent += d.v;
+              onResponseDelta(d.v);
+            }
+          }
+          continue;
+        }
+
+        // 完成信号
+        if (d.p === 'response/status' && d.v === 'FINISHED') {
+          console.log('[SSE] 检测到 FINISHED 信号');
+          if (!responseContent && thinkContent) {
+            console.log('[SSE] 模型只输出了思考（THINK），正文（RESPONSE）为空，THINK长度:', thinkContent.length);
+          }
+          onFinished();
+        }
+      }
+    };
+  }
+
+  async function sendAndWait(text, cancelState = null, onDelta = null, retryCount = 0) {
     console.log('\x1b[36m[DEBUG] === 发送消息 ===\x1b[0m');
     console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', text.slice(0, 100));
 
@@ -563,6 +732,25 @@ async function main() {
       console.log('[HTTP] 等待发送按钮可用超时，仍尝试发送');
     }
 
+    // 设置流式 SSE 解析器（在点击发送前，通过页面内 fetch 拦截实时接收增量）
+    let finishedResolve;
+    const finishedPromise = new Promise(resolve => { finishedResolve = resolve; });
+    let fullContent = '';
+    let sseChunkCount = 0;
+    let sseRawBytes = 0;
+    const parser = createSSEParser(
+      (delta) => {
+        fullContent += delta;
+        if (onDelta) { try { onDelta(delta); } catch (e) {} }
+      },
+      () => { finishedResolve(); }
+    );
+    sseDeltaHandler = (chunk) => {
+      sseChunkCount++;
+      sseRawBytes += chunk.length;
+      try { parser(chunk); } catch (e) {}
+    };
+
     // 点击发送按钮
     const sendBtn = await findSendButton();
     if (sendBtn) {
@@ -592,16 +780,64 @@ async function main() {
       return null;
     }
 
-    console.log('\x1b[35m[DEBUG] 进入 waitForReply\x1b[0m');
-    const reply = await waitForReply(cancelState);
-    if (reply) {
+    console.log('\x1b[35m[DEBUG] 等待 SSE 回复...\x1b[0m');
+    await Promise.race([
+      finishedPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('SSE timeout')), 5 * 60 * 1000))
+    ]).catch(e => {
+      console.log('[DEBUG] SSE 等待异常:', e.message);
+    });
+    if (fullContent) {
+      sseDeltaHandler = null;
       console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
-      console.log('\x1b[32m[DEBUG] 长度:\x1b[0m', reply.length);
-      console.log('\x1b[32m[DEBUG] 前 200 字符:\x1b[0m', reply.slice(0, 200));
-      return reply;
+      console.log('\x1b[32m[DEBUG] 长度:\x1b[0m', fullContent.length);
+      console.log('\x1b[32m[DEBUG] 前 200 字符:\x1b[0m', fullContent.slice(0, 200));
+      return fullContent;
     } else {
+      // FINISHED 但正文为空：先保持监听等待几秒，看是否有后续 completion 请求带正文到来（深度思考可能分多请求输出）
+      console.log('[DEBUG] FINISHED 但正文为空，等待后续请求 5 秒...');
+      await page.waitForTimeout(5000);
+      sseDeltaHandler = null;
+
+      if (fullContent) {
+        console.log('\x1b[32m[DEBUG] 后续请求带来了正文，长度:\x1b[0m', fullContent.length);
+        return fullContent;
+      }
+
       console.log('\x1b[31m[DEBUG] 未收到回复\x1b[0m');
-      return null;  // 不再递归重试
+      console.log(`[DEBUG][SSE诊断] chunk数=${sseChunkCount}, 原始字节=${sseRawBytes}, content长度=${fullContent.length}`);
+
+      // 模型只输出了思考（THINK）而正文为空，尝试点击「重新生成」按钮重试
+      if (retryCount < 1) {
+        const retryBtn = await detectRetryButton();
+        if (retryBtn) {
+          console.log('[DEBUG] 检测到重试按钮，点击重新生成...');
+          let finishedResolve2;
+          const finishedPromise2 = new Promise(resolve => { finishedResolve2 = resolve; });
+          let fullContent2 = '';
+          const parser2 = createSSEParser(
+            (delta) => { fullContent2 += delta; if (onDelta) { try { onDelta(delta); } catch (e) {} } },
+            () => { finishedResolve2(); }
+          );
+          sseDeltaHandler = (chunk) => { try { parser2(chunk); } catch (e) {} };
+          await retryBtn.click();
+          await Promise.race([
+            finishedPromise2,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('SSE timeout')), 5 * 60 * 1000))
+          ]).catch(e => { console.log('[DEBUG] 重试 SSE 等待异常:', e.message); });
+          sseDeltaHandler = null;
+          if (fullContent2) {
+            console.log('\x1b[32m[DEBUG] 重试后收到回复，长度:\x1b[0m', fullContent2.length);
+            return fullContent2;
+          }
+          console.log('[DEBUG] 重试后仍未收到回复');
+        } else {
+          console.log('[DEBUG] 未检测到重试按钮，重新发送消息重试...');
+          await page.waitForTimeout(1000);
+          return sendAndWait(text, cancelState, onDelta, retryCount + 1);
+        }
+      }
+      return null;
     }
   }
 
@@ -743,10 +979,10 @@ async function main() {
       return cleaned.length > 0 ? cleaned : null;
     }
 
-    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, cancelState) {
+    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, cancelState, onDelta = null) {
       const hasTools = toolsText && toolsText !== '无';
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
-      let reply = await sendAndWait(prompt, cancelState);
+      let reply = await sendAndWait(prompt, cancelState, onDelta);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
       const firstOutput = rawOutput; // 保存模型第一次的原始回答，作为回退使用
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
@@ -949,6 +1185,51 @@ async function main() {
     `<parameter name="limit">95</parameter>\n` +
     `</invoke>\n`
   : '';
+            // 真正流式：无工具 + 流式请求时，边接收 SSE 增量边返回给客户端
+            if (data.stream === true && tools.length === 0) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
+              });
+              let responseEnded = false;
+              res.on('error', () => { responseEnded = true; });
+              res.on('close', () => { responseEnded = true; });
+              const chunkId = 'chatcmpl-' + Date.now();
+              const model = 'deepseek-chat';
+              const created = Math.floor(Date.now() / 1000);
+
+              // 发送第一个 chunk（role）
+              res.write(`data: ${JSON.stringify({
+                id: chunkId, object: 'chat.completion.chunk', created, model,
+                choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }]
+              })}\n\n`);
+
+              // onDelta：实时写 content
+              const onDelta = (delta) => {
+                if (!responseEnded && res.writable) {
+                  res.write(`data: ${JSON.stringify({
+                    id: chunkId, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+                  })}\n\n`);
+                }
+              };
+
+              const streamPrompt = `【可用工具】\n无\n\n${promptText}`;
+              await sendAndWait(streamPrompt, cancelState, onDelta);
+
+              // 发送 finish_reason + DONE
+              if (!responseEnded && res.writable) {
+                res.write(`data: ${JSON.stringify({
+                  id: chunkId, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+                })}\n\n`);
+                res.write('data: [DONE]\n\n');
+              }
+              res.end();
+              return;
+            }
+
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
               promptText, toolsText, toolCallInstructions, toolNames, cancelState
             );
