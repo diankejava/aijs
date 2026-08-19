@@ -738,10 +738,16 @@ async function main() {
     let fullContent = '';
     let sseChunkCount = 0;
     let sseRawBytes = 0;
+    let streamingStopped = false;
     const parser = createSSEParser(
       (delta) => {
         fullContent += delta;
-        if (onDelta) { try { onDelta(delta); } catch (e) {} }
+        // 一旦检测到 <invoke>（工具调用开始），停止流式输出，等完整正文再解析
+        if (!streamingStopped && fullContent.includes('<invoke')) {
+          streamingStopped = true;
+          console.log('[DEBUG] 检测到 <invoke>，停止流式输出，等待完整工具调用');
+        }
+        if (onDelta && !streamingStopped) { try { onDelta(delta); } catch (e) {} }
       },
       () => { finishedResolve(); }
     );
@@ -1185,16 +1191,20 @@ async function main() {
     `<parameter name="limit">95</parameter>\n` +
     `</invoke>\n`
   : '';
-            // 真正流式：无工具 + 流式请求时，边接收 SSE 增量边返回给客户端
-            if (data.stream === true && tools.length === 0) {
+            // ===== 流式基础设施：data.stream === true 时，提前设置响应头 + onDelta =====
+            let streamCtx = null;
+            if (data.stream === true) {
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive'
               });
               let responseEnded = false;
-              res.on('error', () => { responseEnded = true; });
-              res.on('close', () => { responseEnded = true; });
+              const markEnded = (reason) => {
+                if (!responseEnded) { responseEnded = true; console.log(`[HTTP] 响应流中断: ${reason}`); }
+              };
+              res.on('error', (err) => markEnded(`error: ${err.message}`));
+              res.on('close', () => markEnded('close'));
               const chunkId = 'chatcmpl-' + Date.now();
               const model = 'deepseek-chat';
               const created = Math.floor(Date.now() / 1000);
@@ -1205,7 +1215,6 @@ async function main() {
                 choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }]
               })}\n\n`);
 
-              // onDelta：实时写 content
               const onDelta = (delta) => {
                 if (!responseEnded && res.writable) {
                   res.write(`data: ${JSON.stringify({
@@ -1215,13 +1224,16 @@ async function main() {
                 }
               };
 
-              const streamPrompt = `【可用工具】\n无\n\n${promptText}`;
-              await sendAndWait(streamPrompt, cancelState, onDelta);
+              streamCtx = { isEnded: () => responseEnded, chunkId, model, created, onDelta };
+            }
 
-              // 发送 finish_reason + DONE
-              if (!responseEnded && res.writable) {
+            // 真正流式：无工具 + 流式请求时，正文边接收边返回
+            if (data.stream === true && tools.length === 0) {
+              const streamPrompt = `【可用工具】\n无\n\n${promptText}`;
+              await sendAndWait(streamPrompt, cancelState, streamCtx.onDelta);
+              if (!streamCtx.isEnded() && res.writable) {
                 res.write(`data: ${JSON.stringify({
-                  id: chunkId, object: 'chat.completion.chunk', created, model,
+                  id: streamCtx.chunkId, object: 'chat.completion.chunk', created: streamCtx.created, model: streamCtx.model,
                   choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
                 })}\n\n`);
                 res.write('data: [DONE]\n\n');
@@ -1231,7 +1243,8 @@ async function main() {
             }
 
             const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
-              promptText, toolsText, toolCallInstructions, toolNames, cancelState
+              promptText, toolsText, toolCallInstructions, toolNames, cancelState,
+              streamCtx ? streamCtx.onDelta : null
             );
 
             const hasTool = toolCalls && toolCalls.length > 0;
@@ -1296,187 +1309,56 @@ async function main() {
               }
             }
 
-            // ---- 流式响应（简单处理：工具调用时不流式，直接一次性返回；纯文本保持原逻辑）----
+            // ---- 流式响应（响应头 + role chunk 已在 streamCtx 设置，正文说明已通过 onDelta 流式输出）----
             if (data.stream === true) {
-              // 先设置响应头
-              res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive'
-              });
-
-              // 监听响应流异常/关闭
-              let responseEnded = false;
-              const markEnded = (reason) => {
-                if (!responseEnded) {
-                  responseEnded = true;
-                  console.log(`[HTTP] 响应流中断: ${reason}`);
-                }
-              };
-              res.on('error', (err) => markEnded(`error: ${err.message}`));
-              res.on('close', () => markEnded('close'));
-
-              const chunkId = 'chatcmpl-' + Date.now();
-              const model = 'deepseek-chat';
-
-              // 1. 发送第一个 delta，包含 role
-              if (!responseEnded && res.writable) {
-                const firstChunk = {
-                  id: chunkId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [{
-                    index: 0,
-                    delta: { role: 'assistant', content: null },
-                    finish_reason: null
-                  }]
-                };
-                res.write(`data: ${JSON.stringify(firstChunk)}\n\n`);
-              }
+              const { chunkId, model, created, isEnded } = streamCtx;
+              const alive = () => !isEnded() && res.writable;
 
               if (hasTool) {
-                // ★ 先流式发送文字说明（如果存在）
-                if (assistantContent) {
-                  for (const char of assistantContent) {
-                    if (responseEnded || !res.writable) break;
-                    const chunk = {
-                      id: chunkId,
-                      object: 'chat.completion.chunk',
-                      created: Math.floor(Date.now() / 1000),
-                      model: model,
-                      choices: [{
-                        index: 0,
-                        delta: { content: char },
-                        finish_reason: null
-                      }]
-                    };
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                    await new Promise(r => setTimeout(r, 20));
-                  }
-                }
-
-                // 2. 工具调用流式发送（支持多个）
+                // 正文说明（<invoke> 之前的纯文本）已通过 onDelta 流式输出，这里只发送工具调用块
                 for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
                   const tc = toolCalls[tcIdx];
                   const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
                   const argsStr = JSON.stringify(tc.arguments);
 
                   // 发送 tool_call 开始块
-                  if (!responseEnded && res.writable) {
-                    const toolStartChunk = {
-                      id: chunkId,
-                      object: 'chat.completion.chunk',
-                      created: Math.floor(Date.now() / 1000),
-                      model: model,
-                      choices: [{
-                        index: 0,
-                        delta: {
-                          tool_calls: [{
-                            index: tcIdx,
-                            id: toolCallId,
-                            type: 'function',
-                            function: {
-                              name: tc.name,
-                              arguments: ''
-                            }
-                          }]
-                        },
-                        finish_reason: null
-                      }]
-                    };
-                    res.write(`data: ${JSON.stringify(toolStartChunk)}\n\n`);
+                  if (alive()) {
+                    res.write(`data: ${JSON.stringify({
+                      id: chunkId, object: 'chat.completion.chunk', created, model,
+                      choices: [{ index: 0, delta: { tool_calls: [{ index: tcIdx, id: toolCallId, type: 'function', function: { name: tc.name, arguments: '' } }] }, finish_reason: null }]
+                    })}\n\n`);
                   }
 
                   // 逐步发送 arguments
                   for (let i = 0; i < argsStr.length; i++) {
-                    if (responseEnded || !res.writable) {
-                      console.log('[HTTP] 流式发送 arguments 过程中检测到连接断开，提前终止');
-                      break;
-                    }
-                    const argChunk = {
-                      id: chunkId,
-                      object: 'chat.completion.chunk',
-                      created: Math.floor(Date.now() / 1000),
-                      model: model,
-                      choices: [{
-                        index: 0,
-                        delta: {
-                          tool_calls: [{
-                            index: tcIdx,
-                            function: {
-                              arguments: argsStr[i]
-                            }
-                          }]
-                        },
-                        finish_reason: null
-                      }]
-                    };
-                    res.write(`data: ${JSON.stringify(argChunk)}\n\n`);
+                    if (!alive()) break;
+                    res.write(`data: ${JSON.stringify({
+                      id: chunkId, object: 'chat.completion.chunk', created, model,
+                      choices: [{ index: 0, delta: { tool_calls: [{ index: tcIdx, function: { arguments: argsStr[i] } }] }, finish_reason: null }]
+                    })}\n\n`);
                     await new Promise(r => setTimeout(r, 5));
                   }
 
-                  if (responseEnded || !res.writable) break;
+                  if (!alive()) break;
                 }
 
-                // 发送 finish_reason 和 DONE
-                if (!responseEnded && res.writable) {
-                  const finalChunk = {
-                    id: chunkId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: {},
-                      finish_reason: 'tool_calls'
-                    }]
-                  };
-                  res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                if (alive()) {
+                  res.write(`data: ${JSON.stringify({
+                    id: chunkId, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
+                  })}\n\n`);
                   res.write('data: [DONE]\n\n');
                   res.end();
-                } else {
-                  console.log('[HTTP] 工具调用流式响应结束，但连接已不可写，跳过发送结束标记');
                 }
               } else {
-                // 3. 普通文本流式输出
-                for (const char of rawOutput) {
-                  if (responseEnded || !res.writable) {
-                    console.log('[HTTP] 普通文本流式发送过程中检测到连接断开，提前终止');
-                    break;
-                  }
-                  const chunk = {
-                    id: chunkId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: { content: char },
-                      finish_reason: null
-                    }]
-                  };
-                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                  await new Promise(r => setTimeout(r, 20));
-                }
-
-                if (!responseEnded && res.writable) {
-                  const finalChunk = {
-                    id: chunkId,
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: {},
-                      finish_reason: 'stop'
-                    }]
-                  };
-                  res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                // 无工具调用（纯文本），正文已通过 onDelta 流式输出，只发 finish + DONE
+                if (alive()) {
+                  res.write(`data: ${JSON.stringify({
+                    id: chunkId, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+                  })}\n\n`);
                   res.write('data: [DONE]\n\n');
                   res.end();
-                } else {
-                  console.log('[HTTP] 普通文本流式响应结束，但连接已不可写，跳过发送结束标记');
                 }
               }
               return;
