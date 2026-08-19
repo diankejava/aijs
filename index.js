@@ -738,36 +738,50 @@ async function main() {
     let fullContent = '';
     let sseChunkCount = 0;
     let sseRawBytes = 0;
-    let streamingStopped = false;
+    let inInvoke = false; // 是否在 <invoke> 内
     let outputLen = 0; // 已通过 onDelta 输出的长度（fullContent 的索引）
     const parser = createSSEParser(
       (delta) => {
         fullContent += delta;
-        if (streamingStopped) return;
 
-        const INVOKE = '<invoke';
+        const INVOKE_OPEN = '<invoke';
+        const INVOKE_CLOSE = '</invoke>';
 
-        // 1. 检测到完整 <invoke：只输出 <invoke 之前未输出的部分，然后停止流式
-        const invokeIdx = fullContent.indexOf(INVOKE);
-        if (invokeIdx !== -1) {
-          if (invokeIdx > outputLen && onDelta) { try { onDelta(fullContent.slice(outputLen, invokeIdx)); } catch (e) {} }
-          streamingStopped = true;
-          console.log('[DEBUG] 检测到 <invoke>，停止流式输出，等待完整工具调用');
-          return;
-        }
-
-        // 2. 检测末尾是否是 <invoke 的前缀（跨增量），暂存前缀，只输出安全部分
-        let safeLen = fullContent.length;
-        for (let i = 1; i < INVOKE.length; i++) {
-          if (fullContent.endsWith(INVOKE.slice(0, i))) {
-            safeLen = fullContent.length - i;
-            break;
+        // 逐段扫描新增部分，输出 <invoke> 外的文本，跳过 <invoke> 内的内容
+        let out = '';
+        let i = outputLen;
+        while (i < fullContent.length) {
+          if (!inInvoke) {
+            const rest = fullContent.slice(i);
+            if (rest.startsWith(INVOKE_OPEN)) {
+              // 进入工具调用块，停止流式（后续内容等 </invoke> 再恢复）
+              inInvoke = true;
+              i += INVOKE_OPEN.length;
+              continue;
+            }
+            // 检查 rest 是否恰好是 <invoke 的前缀（跨增量），暂存等下一个增量确认
+            let isPrefix = false;
+            for (let k = 1; k < INVOKE_OPEN.length; k++) {
+              if (rest === INVOKE_OPEN.slice(0, k)) { isPrefix = true; break; }
+            }
+            if (isPrefix) break;
+            out += fullContent[i];
+            i++;
+          } else {
+            const rest = fullContent.slice(i);
+            if (rest.startsWith(INVOKE_CLOSE)) {
+              // 工具调用块结束，恢复流式
+              inInvoke = false;
+              i += INVOKE_CLOSE.length;
+              continue;
+            }
+            // 工具调用块内部，跳过（不流式）
+            i++;
           }
         }
-        if (safeLen > outputLen && onDelta) {
-          try { onDelta(fullContent.slice(outputLen, safeLen)); } catch (e) {}
-          outputLen = safeLen;
-        }
+        outputLen = i;
+
+        if (out && onDelta) { try { onDelta(out); } catch (e) {} }
       },
       () => { finishedResolve(); }
     );
@@ -1361,7 +1375,7 @@ async function main() {
               const alive = () => !isEnded() && res.writable;
 
               if (hasTool) {
-                // 正文说明（<invoke> 之前的纯文本）已通过 onDelta 流式输出，这里只发送工具调用块
+                // 正文说明已通过 onDelta 流式输出，这里只发送工具调用块
                 for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
                   const tc = toolCalls[tcIdx];
                   const toolCallId = 'call_' + Math.random().toString(36).substr(2, 9);
