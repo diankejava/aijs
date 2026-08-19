@@ -739,15 +739,35 @@ async function main() {
     let sseChunkCount = 0;
     let sseRawBytes = 0;
     let streamingStopped = false;
+    let outputLen = 0; // 已通过 onDelta 输出的长度（fullContent 的索引）
     const parser = createSSEParser(
       (delta) => {
         fullContent += delta;
-        // 一旦检测到 <invoke>（工具调用开始），停止流式输出，等完整正文再解析
-        if (!streamingStopped && fullContent.includes('<invoke')) {
+        if (streamingStopped) return;
+
+        const INVOKE = '<invoke';
+
+        // 1. 检测到完整 <invoke：只输出 <invoke 之前未输出的部分，然后停止流式
+        const invokeIdx = fullContent.indexOf(INVOKE);
+        if (invokeIdx !== -1) {
+          if (invokeIdx > outputLen && onDelta) { try { onDelta(fullContent.slice(outputLen, invokeIdx)); } catch (e) {} }
           streamingStopped = true;
           console.log('[DEBUG] 检测到 <invoke>，停止流式输出，等待完整工具调用');
+          return;
         }
-        if (onDelta && !streamingStopped) { try { onDelta(delta); } catch (e) {} }
+
+        // 2. 检测末尾是否是 <invoke 的前缀（跨增量），暂存前缀，只输出安全部分
+        let safeLen = fullContent.length;
+        for (let i = 1; i < INVOKE.length; i++) {
+          if (fullContent.endsWith(INVOKE.slice(0, i))) {
+            safeLen = fullContent.length - i;
+            break;
+          }
+        }
+        if (safeLen > outputLen && onDelta) {
+          try { onDelta(fullContent.slice(outputLen, safeLen)); } catch (e) {}
+          outputLen = safeLen;
+        }
       },
       () => { finishedResolve(); }
     );
@@ -895,13 +915,31 @@ async function main() {
           continue;
         }
 
-        // 解析 <parameter name="参数名">参数值</parameter>
+        // 解析 <parameter name="参数名">参数值</parameter>（手动解析，CDATA 感知：CDATA 包裹的内容一律当作值，不当标签）
         const args = {};
-        const paramRegex = /<parameter\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/parameter>/gi;
+        const paramOpenRegex = /<parameter\s+name\s*=\s*"([^"]*)"\s*>/gi;
         let pm;
-        while ((pm = paramRegex.exec(rawBody)) !== null) {
+        while ((pm = paramOpenRegex.exec(rawBody)) !== null) {
           const pName = pm[1].trim();
-          const pValue = pm[2].trim();
+          let pos = pm.index + pm[0].length;
+          let pValue = '';
+
+          // 值被 CDATA 包裹时，CDATA 里的内容（含 <invoke>/<parameter>/</parameter> 等）都当作值的一部分
+          if (rawBody.startsWith('<![CDATA[', pos)) {
+            const cdataStart = pos + '<![CDATA['.length;
+            const cdataEnd = rawBody.indexOf(']]>', cdataStart);
+            if (cdataEnd === -1) { break; }
+            pValue = rawBody.slice(cdataStart, cdataEnd);
+            pos = cdataEnd + ']]>'.length;
+          } else {
+            const endIdx = rawBody.indexOf('</parameter>', pos);
+            if (endIdx === -1) { break; }
+            pValue = rawBody.slice(pos, endIdx);
+            pos = endIdx;
+          }
+
+          // 剥离可能的嵌套 CDATA 标记，取真实值
+          pValue = pValue.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim();
 
           // 智能类型转换：纯数字字符串自动转 Number（offset/limit 等）
           const cleanedValue = pValue.replace(/\s+/g, '');
@@ -911,6 +949,11 @@ async function main() {
           } else {
             args[pName] = pValue;
           }
+
+          // 跳到当前参数的 </parameter> 之后，继续找下一个参数
+          const closeIdx = rawBody.indexOf('</parameter>', pos);
+          if (closeIdx === -1) { break; }
+          paramOpenRegex.lastIndex = closeIdx + '</parameter>'.length;
         }
 
         // 只保留合法的参数名，丢弃无效键
@@ -1189,7 +1232,10 @@ async function main() {
     `<parameter name="filePath">E:\\path\\to\\file.java</parameter>\n` +
     `<parameter name="offset">120</parameter>\n` +
     `<parameter name="limit">95</parameter>\n` +
-    `</invoke>\n`
+    `</invoke>\n\n` +
+    `【工具使用规则（最高优先级）】：\n` +
+    `- 修改文件时，优先使用 edit 工具，绝对不要用 write 整体覆盖。\n` +
+    `- 如果 edit 失败，说明文件内容/结构已经变化，必须先重新 read 读取最新内容，再基于最新内容 edit，而不是改用 write 覆盖。\n`
   : '';
             // ===== 流式基础设施：data.stream === true 时，提前设置响应头 + onDelta =====
             let streamCtx = null;
