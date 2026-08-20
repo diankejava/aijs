@@ -253,21 +253,28 @@ async function main() {
     return null;
   }
 
-  // 检测重试按钮（中英文 + CSS 类名）
+  // 检测重试按钮（中英文 + CSS 类名 + text/aria/title）
   async function detectRetryButton() {
-    const retryPatterns = ['重试', '重新生成', 'Retry', 'Refresh', 'refresh', 'retry'];
+    const retryPatterns = ['重试', '重新生成', '重新发送', 'Retry', 'Refresh', 'refresh', 'retry', '超时', 'timeout', 'Timeout', '重新加载', '生成失败', '重新回答'];
     try {
       const buttons = page.locator('button, [role="button"]');
       const count = await buttons.count();
       for (let i = 0; i < count; i++) {
         const btn = buttons.nth(i);
         try {
-          const text = await btn.innerText({ timeout: 2000 });
+          // 同时检查 text、aria-label、title（新版按钮可能无文字，只有 aria/title）
+          let text = '';
+          let aria = '';
+          let title = '';
+          try { text = await btn.innerText({ timeout: 1500 }); } catch (e) {}
+          try { aria = await btn.getAttribute('aria-label') || ''; } catch (e) {}
+          try { title = await btn.getAttribute('title') || ''; } catch (e) {}
+          const combined = text + ' ' + aria + ' ' + title;
           for (const pattern of retryPatterns) {
-            if (text.includes(pattern)) {
-              const visible = await btn.isVisible({ timeout: 2000 });
+            if (combined.includes(pattern)) {
+              const visible = await btn.isVisible({ timeout: 1500 });
               if (visible) {
-                console.log('[重试检测] 发现重试按钮: "' + text.trim() + '"');
+                console.log('[重试检测] 发现重试按钮: "' + combined.trim() + '"');
                 return btn;
               }
             }
@@ -279,7 +286,8 @@ async function main() {
       const warningBtns = page.locator('[role="button"].ds-button--warning, button.ds-button--warning');
       if (await warningBtns.count() > 0) {
         const btn = warningBtns.first();
-        if (await btn.isVisible({ timeout: 2000 })) {
+        if (await btn.isVisible({ timeout: 1500 })) {
+          console.log('[重试检测] 发现 warning 按钮');
           return btn;
         }
       }
@@ -821,33 +829,57 @@ async function main() {
     }
 
     console.log('\x1b[35m[DEBUG] 等待 SSE 回复...\x1b[0m');
+    let timedOut = false;
+
+    // 定期检测页面上的「重试」按钮（DeepSeek 提交后服务端超时会显示「超时重试」），检测到就点击并重置累积
+    const retryCheckTimer = setInterval(async () => {
+      try {
+        const retryBtn = await detectRetryButton();
+        if (retryBtn) {
+          console.log('[DEBUG] 等待中检测到重试按钮，自动点击并重置累积...');
+          await retryBtn.click();
+          fullContent = '';
+          outputLen = 0;
+          inInvoke = false;
+          sseChunkCount = 0;
+          sseRawBytes = 0;
+        }
+      } catch (e) {}
+    }, 3000);
+
     await Promise.race([
       finishedPromise,
       new Promise((_, reject) => setTimeout(() => reject(new Error('SSE timeout')), 5 * 60 * 1000))
     ]).catch(e => {
       console.log('[DEBUG] SSE 等待异常:', e.message);
+      timedOut = true;
     });
-    if (fullContent) {
+
+    clearInterval(retryCheckTimer);
+    if (fullContent && !timedOut) {
       sseDeltaHandler = null;
       console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
       console.log('\x1b[32m[DEBUG] 长度:\x1b[0m', fullContent.length);
       console.log('\x1b[32m[DEBUG] 前 200 字符:\x1b[0m', fullContent.slice(0, 200));
       return fullContent;
     } else {
-      // FINISHED 但正文为空：先保持监听等待几秒，看是否有后续 completion 请求带正文到来（深度思考可能分多请求输出）
-      console.log('[DEBUG] FINISHED 但正文为空，等待后续请求 5 秒...');
-      await page.waitForTimeout(5000);
+      // 超时 或 正文为空
+      if (!timedOut) {
+        // FINISHED 但正文为空：先保持监听等待几秒，看是否有后续 completion 请求带正文到来（深度思考可能分多请求输出）
+        console.log('[DEBUG] FINISHED 但正文为空，等待后续请求 5 秒...');
+        await page.waitForTimeout(5000);
+        if (fullContent) {
+          sseDeltaHandler = null;
+          console.log('\x1b[32m[DEBUG] 后续请求带来了正文，长度:\x1b[0m', fullContent.length);
+          return fullContent;
+        }
+      }
       sseDeltaHandler = null;
 
-      if (fullContent) {
-        console.log('\x1b[32m[DEBUG] 后续请求带来了正文，长度:\x1b[0m', fullContent.length);
-        return fullContent;
-      }
-
-      console.log('\x1b[31m[DEBUG] 未收到回复\x1b[0m');
+      console.log(timedOut ? '\x1b[31m[DEBUG] SSE 超时，正文不完整\x1b[0m' : '\x1b[31m[DEBUG] 未收到回复\x1b[0m');
       console.log(`[DEBUG][SSE诊断] chunk数=${sseChunkCount}, 原始字节=${sseRawBytes}, content长度=${fullContent.length}`);
 
-      // 模型只输出了思考（THINK）而正文为空，尝试点击「重新生成」按钮重试
+      // 超时或正文为空，尝试点击「重新生成」按钮重试
       if (retryCount < 1) {
         const retryBtn = await detectRetryButton();
         if (retryBtn) {
