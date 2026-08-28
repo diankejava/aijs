@@ -295,6 +295,28 @@ async function main() {
     return null;
   }
 
+  // 检测"达到对话长度上限"提示，如果有，点击左上角"开启新对话"按钮
+  async function detectAndHandleLimit() {
+    try {
+      const limitTip = page.locator('text=达到对话长度上限');
+      if (await limitTip.count() > 0 && await limitTip.first().isVisible()) {
+        console.log('[新对话] 检测到"达到对话长度上限"提示，点击"开启新对话"按钮...');
+        const newChatBtn = page.locator('text="开启新对话"').first();
+        if (await newChatBtn.count() > 0 && await newChatBtn.isVisible()) {
+          await newChatBtn.click();
+          console.log('[新对话] 已点击"开启新对话"，等待新对话加载...');
+          await page.waitForTimeout(3000);
+          return true;
+        } else {
+          console.log('[新对话] 未找到"开启新对话"按钮');
+        }
+      }
+    } catch (e) {
+      console.log('[新对话] 检测异常:', e.message);
+    }
+    return false;
+  }
+
   // 提取最后一条 AI 回复（不依赖剪贴板，直接用 textContent 保留缩进与换行）
   async function extractLastReply() {
     try {
@@ -562,7 +584,7 @@ async function main() {
   }
 
   // 流式 SSE 解析器：处理增量 chunk，实时提取 RESPONSE（正文）增量；RESPONSE 空时用 THINK 兜底
-  function createSSEParser(onResponseDelta, onFinished) {
+  function createSSEParser(onResponseDelta, onFinished, onLimitExceeded) {
     let buffer = '';
     let lastPath = '';
     let lastOp = '';
@@ -595,6 +617,12 @@ async function main() {
             }
           }
           continue;
+        }
+
+        // 检测"对话长度上限"错误信号（hint 事件，finish_reason 为 context_length_exceeded）
+        if (d.type === 'error' && d.finish_reason === 'context_length_exceeded') {
+          console.log('[SSE] 检测到对话长度上限错误（context_length_exceeded）');
+          onLimitExceeded();
         }
 
         if (d.p) lastPath = d.p;
@@ -748,6 +776,7 @@ async function main() {
     let sseRawBytes = 0;
     let inInvoke = false; // 是否在 <invoke> 内
     let outputLen = 0; // 已通过 onDelta 输出的长度（fullContent 的索引）
+    let limitExceeded = false; // 是否检测到"对话长度上限"错误
     const parser = createSSEParser(
       (delta) => {
         fullContent += delta;
@@ -791,7 +820,11 @@ async function main() {
 
         if (out && onDelta) { try { onDelta(out); } catch (e) {} }
       },
-      () => { finishedResolve(); }
+      () => { finishedResolve(); },
+      () => {
+        limitExceeded = true;
+        finishedResolve(); // 已满时无 FINISHED 信号，主动触发让等待提前结束
+      }
     );
     sseDeltaHandler = (chunk) => {
       sseChunkCount++;
@@ -808,7 +841,6 @@ async function main() {
       console.log('\x1b[36m[DEBUG] Enter 发送\x1b[0m');
       await editor.press('Enter');
     }
-
 
     // 检测超限提示（限制在通知/错误区域）
     const isOverLimit = await page.evaluate(() => {
@@ -856,6 +888,19 @@ async function main() {
     });
 
     clearInterval(retryCheckTimer);
+
+    // 检测到"对话长度上限"错误（SSE 信号 context_length_exceeded），点击"开启新对话"并重新发送
+    if (limitExceeded) {
+      sseDeltaHandler = null;
+      console.log('[新对话] SSE 检测到对话长度上限，点击"开启新对话"...');
+      await detectAndHandleLimit();
+      if (retryCount < 1) {
+        console.log('[新对话] 已开新对话，重新发送消息...');
+        return sendAndWait(text, cancelState, onDelta, retryCount + 1);
+      }
+      return null;
+    }
+
     if (fullContent && !timedOut) {
       sseDeltaHandler = null;
       console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
