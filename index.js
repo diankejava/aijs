@@ -1003,6 +1003,11 @@ async function main() {
     function parseToolCall(text, allowedNames = []) {
       if (!text) return { found: false, success: false, toolCalls: [], toolCall: null };
 
+      // 清理零宽字符（模型偶尔在标签 < 后混入零宽字符，显示为 <zwnj; 之类，导致 <invoke/<parameter 无法匹配）
+      text = text.replace(/[​‌‍⁠﻿]/g, '')
+                 .replace(/&(?:zwnj|zwj|lrm|rlm);/gi, '')
+                 .replace(/<z(?:wnj|wj)/gi, '<');
+
       const results = [];
 
       // 正则匹配完整的 <invoke name="函数名"> ... </invoke>（支持换行、多个参数）
@@ -1127,6 +1132,16 @@ async function main() {
         }
         if (/<(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?invoke/i.test(text) || text.includes('&lt;｜｜DSML｜｜ invoke') || text.includes('&lt;invoke')) {
           return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <｜｜DSML｜｜ invoke> 标签但无法解析，请使用 <｜｜DSML｜｜ parameter name="参数名">参数值</｜｜DSML｜｜ parameter> 包裹参数' };
+        }
+        // 检测"缺少 <invoke name="函数名"> 开头，但有余下的 </invoke> 或 <parameter>"（模型漏掉了 invoke 开头标签）
+        if (/<\/invoke>|<parameter\b/i.test(text)) {
+          return {
+            found: true,
+            success: false,
+            toolCalls: [],
+            toolCall: null,
+            error: '工具调用格式不完整：缺少 <invoke name="函数名"> 开头标签，请重新输出完整的工具调用'
+          };
         }
         return { found: false, success: false, toolCalls: [], toolCall: null };
       }
