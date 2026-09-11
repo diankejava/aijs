@@ -295,6 +295,28 @@ async function main() {
     return null;
   }
 
+  // 检测"达到对话长度上限"提示，如果有，点击左上角"开启新对话"按钮
+  async function detectAndHandleLimit() {
+    try {
+      const limitTip = page.locator('text=达到对话长度上限');
+      if (await limitTip.count() > 0 && await limitTip.first().isVisible()) {
+        console.log('[新对话] 检测到"达到对话长度上限"提示，点击"开启新对话"按钮...');
+        const newChatBtn = page.locator('text="开启新对话"').first();
+        if (await newChatBtn.count() > 0 && await newChatBtn.isVisible()) {
+          await newChatBtn.click();
+          console.log('[新对话] 已点击"开启新对话"，等待新对话加载...');
+          await page.waitForTimeout(3000);
+          return true;
+        } else {
+          console.log('[新对话] 未找到"开启新对话"按钮');
+        }
+      }
+    } catch (e) {
+      console.log('[新对话] 检测异常:', e.message);
+    }
+    return false;
+  }
+
   // 提取最后一条 AI 回复（不依赖剪贴板，直接用 textContent 保留缩进与换行）
   async function extractLastReply() {
     try {
@@ -562,7 +584,7 @@ async function main() {
   }
 
   // 流式 SSE 解析器：处理增量 chunk，实时提取 RESPONSE（正文）增量；RESPONSE 空时用 THINK 兜底
-  function createSSEParser(onResponseDelta, onFinished) {
+  function createSSEParser(onResponseDelta, onFinished, onLimitExceeded) {
     let buffer = '';
     let lastPath = '';
     let lastOp = '';
@@ -595,6 +617,12 @@ async function main() {
             }
           }
           continue;
+        }
+
+        // 检测"对话长度上限"错误信号（hint 事件，finish_reason 为 context_length_exceeded）
+        if (d.type === 'error' && d.finish_reason === 'context_length_exceeded') {
+          console.log('[SSE] 检测到对话长度上限错误（context_length_exceeded）');
+          onLimitExceeded();
         }
 
         if (d.p) lastPath = d.p;
@@ -746,44 +774,69 @@ async function main() {
     let fullContent = '';
     let sseChunkCount = 0;
     let sseRawBytes = 0;
-    let inInvoke = false; // 是否在 <invoke> 内
-    let outputLen = 0; // 已通过 onDelta 输出的长度（fullContent 的索引）
+    let inToolBlock = false;   // 是否在工具调用块内（<｜｜DSML｜｜ calls> 包裹块 或 裸 <｜｜DSML｜｜ invoke>）
+    let toolBlockEnd = '';     // 当前工具块的结束标记
+    let outputLen = 0;         // 已通过 onDelta 输出的长度（fullContent 的索引）
+    let limitExceeded = false; // 是否检测到"对话长度上限"错误
     const parser = createSSEParser(
-      (delta) => {
+            (delta) => {
         fullContent += delta;
 
-        const INVOKE_OPEN = '<invoke';
-        const INVOKE_CLOSE = '</invoke>';
+        const WRAPPED_OPEN  = '<｜｜DSML｜｜ calls>';
+        const WRAPPED_CLOSE = '</｜｜DSML｜｜ calls>';
+        const INVOKE_OPEN   = '<｜｜DSML｜｜ invoke';
+        const INVOKE_CLOSE  = '</｜｜DSML｜｜ invoke>';
 
-        // 逐段扫描新增部分，输出 <invoke> 外的文本，跳过 <invoke> 内的内容
+        // 逐段扫描新增部分，输出工具调用块之外的文本，跳过块内内容
         let out = '';
         let i = outputLen;
         while (i < fullContent.length) {
-          if (!inInvoke) {
-            const rest = fullContent.slice(i);
+          const rest = fullContent.slice(i);
+          if (!inToolBlock) {
+            // 进入 <｜｜DSML｜｜ calls> 包裹块（新格式）
+            if (rest.startsWith(WRAPPED_OPEN)) {
+              inToolBlock = true;
+              toolBlockEnd = WRAPPED_CLOSE;
+              i += WRAPPED_OPEN.length;
+              continue;
+            }
+            // 兼容裸 <｜｜DSML｜｜ invoke>（无包裹的旧/异常输出）
             if (rest.startsWith(INVOKE_OPEN)) {
-              // 进入工具调用块，停止流式（后续内容等 </invoke> 再恢复）
-              inInvoke = true;
+              inToolBlock = true;
+              toolBlockEnd = INVOKE_CLOSE;
               i += INVOKE_OPEN.length;
               continue;
             }
-            // 检查 rest 是否恰好是 <invoke 的前缀（跨增量），暂存等下一个增量确认
+            // 跨增量前缀检测：当前 rest 可能只是标签开头的一部分，暂存等待后续增量
             let isPrefix = false;
-            for (let k = 1; k < INVOKE_OPEN.length; k++) {
-              if (rest === INVOKE_OPEN.slice(0, k)) { isPrefix = true; break; }
+            for (let k = 1; k < WRAPPED_OPEN.length; k++) {
+              if (rest === WRAPPED_OPEN.slice(0, k)) { isPrefix = true; break; }
+            }
+            if (!isPrefix) {
+              for (let k = 1; k < INVOKE_OPEN.length; k++) {
+                if (rest === INVOKE_OPEN.slice(0, k)) { isPrefix = true; break; }
+              }
             }
             if (isPrefix) break;
+
             out += fullContent[i];
             i++;
           } else {
-            const rest = fullContent.slice(i);
-            if (rest.startsWith(INVOKE_CLOSE)) {
-              // 工具调用块结束，恢复流式
-              inInvoke = false;
-              i += INVOKE_CLOSE.length;
+            // 工具调用块内：等待结束标记
+            if (toolBlockEnd && rest.startsWith(toolBlockEnd)) {
+              i += toolBlockEnd.length;
+              inToolBlock = false;
+              toolBlockEnd = '';
               continue;
             }
-            // 工具调用块内部，跳过（不流式）
+            // 跨增量前缀检测：结束标记可能被切碎（如 "</｜｜DSML｜｜ calls" + ">xxx"），
+            // 若当前 rest 恰好是 toolBlockEnd 的前缀，暂停等待下一个增量补全，避免误吃正文
+            let endIsPrefix = false;
+            for (let k = 1; k < toolBlockEnd.length; k++) {
+              if (rest === toolBlockEnd.slice(0, k)) { endIsPrefix = true; break; }
+            }
+            if (endIsPrefix) break;
+            // 块内内容一律跳过（不流式输出）
             i++;
           }
         }
@@ -791,7 +844,11 @@ async function main() {
 
         if (out && onDelta) { try { onDelta(out); } catch (e) {} }
       },
-      () => { finishedResolve(); }
+      () => { finishedResolve(); },
+      () => {
+        limitExceeded = true;
+        finishedResolve(); // 已满时无 FINISHED 信号，主动触发让等待提前结束
+      }
     );
     sseDeltaHandler = (chunk) => {
       sseChunkCount++;
@@ -808,7 +865,6 @@ async function main() {
       console.log('\x1b[36m[DEBUG] Enter 发送\x1b[0m');
       await editor.press('Enter');
     }
-
 
     // 检测超限提示（限制在通知/错误区域）
     const isOverLimit = await page.evaluate(() => {
@@ -840,7 +896,8 @@ async function main() {
           await retryBtn.click();
           fullContent = '';
           outputLen = 0;
-          inInvoke = false;
+          inToolBlock = false;
+          toolBlockEnd = '';
           sseChunkCount = 0;
           sseRawBytes = 0;
         }
@@ -856,6 +913,19 @@ async function main() {
     });
 
     clearInterval(retryCheckTimer);
+
+    // 检测到"对话长度上限"错误（SSE 信号 context_length_exceeded），点击"开启新对话"并重新发送
+    if (limitExceeded) {
+      sseDeltaHandler = null;
+      console.log('[新对话] SSE 检测到对话长度上限，点击"开启新对话"...');
+      await detectAndHandleLimit();
+      if (retryCount < 1) {
+        console.log('[新对话] 已开新对话，重新发送消息...');
+        return sendAndWait(text, cancelState, onDelta, retryCount + 1);
+      }
+      return null;
+    }
+
     if (fullContent && !timedOut) {
       sseDeltaHandler = null;
       console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
@@ -936,7 +1006,7 @@ async function main() {
       const results = [];
 
       // 正则匹配完整的 <invoke name="函数名"> ... </invoke>（支持换行、多个参数）
-      const invokeRegex = /<invoke\s+name\s*=\s*"([^"]*)"\s*>([\s\S]*?)<\/invoke>/gi;
+      const invokeRegex = /<(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?invoke\s+name\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?invoke>/gi;
       let match;
       while ((match = invokeRegex.exec(text)) !== null) {
         const rawName = match[1].trim();
@@ -963,7 +1033,7 @@ async function main() {
 
         // 解析 <parameter name="参数名">参数值</parameter>（手动解析，CDATA 感知：CDATA 包裹的内容一律当作值，不当标签）
         const args = {};
-        const paramOpenRegex = /<parameter\s+name\s*=\s*"([^"]*)"\s*>/gi;
+        const paramOpenRegex = /<(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?parameter\s+name\s*=\s*"([^"]*)"[^>]*>/gi;
         let pm;
         while ((pm = paramOpenRegex.exec(rawBody)) !== null) {
           const pName = pm[1].trim();
@@ -978,7 +1048,11 @@ async function main() {
             pValue = rawBody.slice(cdataStart, cdataEnd);
             pos = cdataEnd + ']]>'.length;
           } else {
-            const endIdx = rawBody.indexOf('</parameter>', pos);
+            // 优先匹配带 ｜｜DSML｜｜ 前缀的闭标签，找不到再退回到无前缀的写法
+            let endIdx = rawBody.indexOf('</｜｜DSML｜｜ parameter>', pos);
+            if (endIdx === -1) {
+              endIdx = rawBody.indexOf('</parameter>', pos);
+            }
             if (endIdx === -1) { break; }
             pValue = rawBody.slice(pos, endIdx);
             pos = endIdx;
@@ -997,9 +1071,15 @@ async function main() {
           }
 
           // 跳到当前参数的 </parameter> 之后，继续找下一个参数
-          const closeIdx = rawBody.indexOf('</parameter>', pos);
+          // 优先带 ｜｜DSML｜｜ 前缀，找不到则退回无前缀写法
+          let closeIdx = rawBody.indexOf('</｜｜DSML｜｜ parameter>', pos);
+          let closeLen = '</｜｜DSML｜｜ parameter>'.length;
+          if (closeIdx === -1) {
+            closeIdx = rawBody.indexOf('</parameter>', pos);
+            closeLen = '</parameter>'.length;
+          }
           if (closeIdx === -1) { break; }
-          paramOpenRegex.lastIndex = closeIdx + '</parameter>'.length;
+          paramOpenRegex.lastIndex = closeIdx + closeLen;
         }
 
         // 只保留合法的参数名，丢弃无效键
@@ -1025,11 +1105,14 @@ async function main() {
       }
 
       if (results.length === 0) {
-        if (/<(tool_call|tool_calls|function_call|tool_use)/i.test(text)) {
-          // 检测到旧格式标签，提示改用新格式
+        // 捕获无 ｜｜DSML｜｜ 前缀的旧格式标签，也兼容模型误加 ｜｜DSML｜｜ 前缀的变体
+        if (/<(｜｜DSML｜｜\s+)?(tool_call|tool_calls|function_call|tool_use)/i.test(text)) {
           const oldTags = ['tool_call', 'tool_calls', 'function_call', 'tool_use'];
           const foundTags = oldTags.filter(tag =>
-            text.includes(`<${tag}`) || text.includes(`&lt;${tag}`)
+            text.includes(`<${tag}`) ||
+            text.includes(`&lt;${tag}`) ||
+            text.includes(`<｜｜DSML｜｜ ${tag}`) ||
+            text.includes(`&lt;｜｜DSML｜｜ ${tag}`)
           );
           const tagList = foundTags.length > 0
             ? foundTags.map(t => `<${t}>`).join(', ')
@@ -1039,11 +1122,11 @@ async function main() {
             success: false,
             toolCalls: [],
             toolCall: null,
-            error: `检测到旧格式标签：${tagList}，必须使用 <invoke name="函数名"> + <parameter name="参数名">参数值</parameter> 格式`
+            error: `检测到旧格式标签：${tagList}，必须使用 <｜｜DSML｜｜ calls> + <｜｜DSML｜｜ invoke name="函数名"> + <｜｜DSML｜｜ parameter name="参数名">参数值</｜｜DSML｜｜ parameter> 格式`
           };
         }
-        if (text.includes('<invoke') || text.includes('&lt;invoke')) {
-          return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <invoke> 标签但无法解析，请使用 <parameter name="参数名">参数值</parameter> 包裹参数' };
+        if (/<(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?invoke/i.test(text) || text.includes('&lt;｜｜DSML｜｜ invoke') || text.includes('&lt;invoke')) {
+          return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <｜｜DSML｜｜ invoke> 标签但无法解析，请使用 <｜｜DSML｜｜ parameter name="参数名">参数值</｜｜DSML｜｜ parameter> 包裹参数' };
         }
         return { found: false, success: false, toolCalls: [], toolCall: null };
       }
@@ -1102,9 +1185,11 @@ async function main() {
           if (parseResult.success) {
             // 提取工具调用标签之外的纯文本作为助手文字说明
             const textContent = rawOutput
-              .replace(/<invoke[\s\S]*?<\/invoke>/g, '')  // 移除所有 invoke 块
-              .replace(/\n{3,}/g, '\n\n')                         // 压缩多余空行
+              .replace(/<｜｜DSML｜｜ calls>[\s\S]*?<\/｜｜DSML｜｜ calls>/g, '')   // 移除整个包裹块
+              .replace(/<｜｜DSML｜｜ invoke[\s\S]*?<\/｜｜DSML｜｜ invoke>/g, '')   // 兜底移除残留 invoke 块
+              .replace(/\n{3,}/g, '\n\n')                          // 压缩多余空行
               .trim();
+
             return {
               toolCall: parseResult.toolCall,
               toolCalls: parseResult.toolCalls,
@@ -1126,10 +1211,12 @@ async function main() {
             `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
     `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
     `✅ 正确格式（唯一允许）：\n` +
-    `<invoke name="工具名">\n` +
-    `<parameter name="参数名1">参数值1</parameter>\n` +
-    `<parameter name="参数名2">参数值2</parameter>\n` +
-    `</invoke>\n`;
+    `<｜｜DSML｜｜ calls>\n` +
+    `<｜｜DSML｜｜ invoke name="工具名">\n` +
+    `<｜｜DSML｜｜ parameter name="参数名1">参数值1</｜｜DSML｜｜ parameter>\n` +
+    `<｜｜DSML｜｜ parameter name="参数名2">参数值2</｜｜DSML｜｜ parameter>\n` +
+    `</｜｜DSML｜｜ invoke>\n` +
+    `</｜｜DSML｜｜ calls>\n`;
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
@@ -1265,20 +1352,29 @@ async function main() {
             const toolsText = tools.length > 0
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
-            const toolCallInstructions = tools.length > 0
+                        const toolCallInstructions = tools.length > 0
   ? `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
     `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
     `✅ 正确格式（唯一允许）：\n` +
-    `<invoke name="工具名">\n` +
-    `<parameter name="参数名1">参数值1</parameter>\n` +
-    `<parameter name="参数名2">参数值2</parameter>\n` +
-    `</invoke>\n\n` +
+    `<｜｜DSML｜｜ calls>\n` +
+    `<｜｜DSML｜｜ invoke name="工具名">\n` +
+    `<｜｜DSML｜｜ parameter name="参数名1">参数值1</｜｜DSML｜｜ parameter>\n` +
+    `<｜｜DSML｜｜ parameter name="参数名2">参数值2</｜｜DSML｜｜ parameter>\n` +
+    `</｜｜DSML｜｜ invoke>\n` +
+    `</｜｜DSML｜｜ calls>\n\n` +
     `示例（调用 read 工具）：\n` +
-    `<invoke name="read">\n` +
-    `<parameter name="filePath">E:\\path\\to\\file.java</parameter>\n` +
-    `<parameter name="offset">120</parameter>\n` +
-    `<parameter name="limit">95</parameter>\n` +
-    `</invoke>\n\n` +
+    `<｜｜DSML｜｜ calls>\n` +
+    `<｜｜DSML｜｜ invoke name="read">\n` +
+    `<｜｜DSML｜｜ parameter name="filePath">E:\\path\\to\\file.java</｜｜DSML｜｜ parameter>\n` +
+    `<｜｜DSML｜｜ parameter name="offset">120</｜｜DSML｜｜ parameter>\n` +
+    `<｜｜DSML｜｜ parameter name="limit">95</｜｜DSML｜｜ parameter>\n` +
+    `</｜｜DSML｜｜ invoke>\n` +
+    `</｜｜DSML｜｜ calls>\n\n` +
+    `【一次调用多个工具】：<｜｜DSML｜｜ calls> 内可以并列多个 <｜｜DSML｜｜ invoke> 块：\n` +
+    `<｜｜DSML｜｜ calls>\n` +
+    `<｜｜DSML｜｜ invoke name="read">\n<｜｜DSML｜｜ parameter name="filePath">A.java</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n` +
+    `<｜｜DSML｜｜ invoke name="read">\n<｜｜DSML｜｜ parameter name="filePath">B.java</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n` +
+    `</｜｜DSML｜｜ calls>\n\n` +
     `【工具使用规则（最高优先级）】：\n` +
     `- 修改文件时，优先使用 edit 工具，绝对不要用 write 整体覆盖。\n` +
     `- 如果 edit 失败，说明文件内容/结构已经变化，必须先重新 read 读取最新内容，再基于最新内容 edit，而不是改用 write 覆盖。\n`
