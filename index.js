@@ -1042,6 +1042,10 @@ async function main() {
         let pm;
         while ((pm = paramOpenRegex.exec(rawBody)) !== null) {
           const pName = pm[1].trim();
+          const openTag = pm[0];
+          // 从开标签里提取 string="true" / string="false"（可选属性）
+          const stringAttrMatch = openTag.match(/\bstring\s*=\s*"([^"]*)"/i);
+          const stringAttr = stringAttrMatch ? stringAttrMatch[1].toLowerCase() : null;
           let pos = pm.index + pm[0].length;
           let pValue = '';
 
@@ -1053,38 +1057,46 @@ async function main() {
             pValue = rawBody.slice(cdataStart, cdataEnd);
             pos = cdataEnd + ']]>'.length;
           } else {
-            // 优先匹配带 ｜｜DSML｜｜ 前缀的闭标签，找不到再退回到无前缀的写法
-            let endIdx = rawBody.indexOf('</｜｜DSML｜｜ parameter>', pos);
-            if (endIdx === -1) {
-              endIdx = rawBody.indexOf('</parameter>', pos);
-            }
-            if (endIdx === -1) { break; }
-            pValue = rawBody.slice(pos, endIdx);
-            pos = endIdx;
+            // 用正则匹配闭合标签：容忍 "/" 或 "\" 甚至缺失斜杠，兼容带/不带 ｜｜DSML｜｜ 前缀
+            const closeRe = /<[\\/]?(?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?parameter>/i;
+            const afterOpen = rawBody.slice(pos);
+            const mc = afterOpen.match(closeRe);
+            if (!mc) { break; }
+            pValue = afterOpen.slice(0, mc.index);
+            pos = pos + mc.index + mc[0].length;
           }
 
           // 剥离可能的嵌套 CDATA 标记，取真实值
           pValue = pValue.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim();
 
-          // 智能类型转换：纯数字字符串自动转 Number（offset/limit 等）
-          const cleanedValue = pValue.replace(/\s+/g, '');
-          const numVal = Number(cleanedValue);
-          if (cleanedValue !== '' && !isNaN(numVal) && String(numVal) === cleanedValue) {
-            args[pName] = numVal;
-          } else {
+          // 类型转换：优先依据标签上的 string 属性；没有该属性时才回退到"纯数字自动转 Number"的启发式
+          if (stringAttr === 'true') {
+            // 明确声明是字符串，保持原样
             args[pName] = pValue;
+          } else if (stringAttr === 'false') {
+            // 明确声明是非字符串，尝试转数字/布尔；都不是则保留原文本
+            const cleaned = pValue.replace(/\s+/g, '');
+            const numVal = Number(cleaned);
+            if (cleaned !== '' && !isNaN(numVal) && String(numVal) === cleaned) {
+              args[pName] = numVal;
+            } else if (cleaned === 'true' || cleaned === 'false') {
+              args[pName] = cleaned === 'true';
+            } else {
+              args[pName] = pValue;
+            }
+          } else {
+            // 未声明类型：保留原有启发式
+            const cleanedValue = pValue.replace(/\s+/g, '');
+            const numVal = Number(cleanedValue);
+            if (cleanedValue !== '' && !isNaN(numVal) && String(numVal) === cleanedValue) {
+              args[pName] = numVal;
+            } else {
+              args[pName] = pValue;
+            }
           }
 
-          // 跳到当前参数的 </parameter> 之后，继续找下一个参数
-          // 优先带 ｜｜DSML｜｜ 前缀，找不到则退回无前缀写法
-          let closeIdx = rawBody.indexOf('</｜｜DSML｜｜ parameter>', pos);
-          let closeLen = '</｜｜DSML｜｜ parameter>'.length;
-          if (closeIdx === -1) {
-            closeIdx = rawBody.indexOf('</parameter>', pos);
-            closeLen = '</parameter>'.length;
-          }
-          if (closeIdx === -1) { break; }
-          paramOpenRegex.lastIndex = closeIdx + closeLen;
+          // pos 已在上面推进到闭合标签之后，直接用它作为下一次搜索起点
+          paramOpenRegex.lastIndex = pos;
         }
 
         // 只保留合法的参数名，丢弃无效键
@@ -1133,14 +1145,17 @@ async function main() {
         if (/<(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?invoke/i.test(text) || text.includes('&lt;｜｜DSML｜｜ invoke') || text.includes('&lt;invoke')) {
           return { found: true, success: false, toolCalls: [], toolCall: null, error: '存在 <｜｜DSML｜｜ invoke> 标签但无法解析，请使用 <｜｜DSML｜｜ parameter name="参数名">参数值</｜｜DSML｜｜ parameter> 包裹参数' };
         }
-        // 检测"缺少 <invoke name="函数名"> 开头，但有余下的 </invoke> 或 <parameter>"（模型漏掉了 invoke 开头标签）
-        if (/<\/invoke>|<parameter\b/i.test(text)) {
+        // 检测"缺少 <invoke name="函数名"> 开头，但有余下的 invoke 闭合标签 或 parameter 开标签"
+        // 兼容带/不带 ｜｜DSML｜｜ 前缀，兼容 "/" "\" 或不带斜杠的闭合标签
+        const danglingInvokeClose = /<[\\/]?\s*(?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?invoke\s*>/i.test(text);
+        const danglingParam = /<(?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?parameter\b/i.test(text);
+        if (danglingInvokeClose || danglingParam) {
           return {
             found: true,
             success: false,
             toolCalls: [],
             toolCall: null,
-            error: '工具调用格式不完整：缺少 <invoke name="函数名"> 开头标签，请重新输出完整的工具调用'
+            error: '工具调用格式不完整：缺少 <｜｜DSML｜｜ invoke name="函数名"> 开头标签，请重新输出完整的工具调用'
           };
         }
         return { found: false, success: false, toolCalls: [], toolCall: null };
@@ -1392,7 +1407,8 @@ async function main() {
     `</｜｜DSML｜｜ calls>\n\n` +
     `【工具使用规则（最高优先级）】：\n` +
     `- 修改文件时，优先使用 edit 工具，绝对不要用 write 整体覆盖。\n` +
-    `- 如果 edit 失败，说明文件内容/结构已经变化，必须先重新 read 读取最新内容，再基于最新内容 edit，而不是改用 write 覆盖。\n`
+    `- 如果 edit 失败，说明文件内容/结构已经变化，必须先重新 read 读取最新内容，再基于最新内容 edit，而不是改用 write 覆盖。\n` +
+    `❌ 闭合标签必须使用正斜杠：</｜｜DSML｜｜ parameter>，绝对禁止写成 <\｜｜DSML｜｜ parameter> 或其它形式。\n`
   : '';
             // ===== 流式基础设施：data.stream === true 时，提前设置响应头 + onDelta =====
             let streamCtx = null;
