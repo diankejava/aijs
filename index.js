@@ -807,7 +807,16 @@ async function main() {
               i += INVOKE_OPEN.length;
               continue;
             }
-            // 跨增量前缀检测：当前 rest 可能只是标签开头的一部分，暂存等待后续增量
+            // 兜底：模型漏掉开标签，但闭标签仍出现 → 直接把闭标签吃掉，不输出给客户端
+            if (rest.startsWith(WRAPPED_CLOSE)) {
+              i += WRAPPED_CLOSE.length;
+              continue;
+            }
+            if (rest.startsWith(INVOKE_CLOSE)) {
+              i += INVOKE_CLOSE.length;
+              continue;
+            }
+            // 跨增量前缀检测：开标签或闭标签被切碎时暂存等下一帧
             let isPrefix = false;
             for (let k = 1; k < WRAPPED_OPEN.length; k++) {
               if (rest === WRAPPED_OPEN.slice(0, k)) { isPrefix = true; break; }
@@ -815,6 +824,16 @@ async function main() {
             if (!isPrefix) {
               for (let k = 1; k < INVOKE_OPEN.length; k++) {
                 if (rest === INVOKE_OPEN.slice(0, k)) { isPrefix = true; break; }
+              }
+            }
+            if (!isPrefix) {
+              for (let k = 1; k < WRAPPED_CLOSE.length; k++) {
+                if (rest === WRAPPED_CLOSE.slice(0, k)) { isPrefix = true; break; }
+              }
+            }
+            if (!isPrefix) {
+              for (let k = 1; k < INVOKE_CLOSE.length; k++) {
+                if (rest === INVOKE_CLOSE.slice(0, k)) { isPrefix = true; break; }
               }
             }
             if (isPrefix) break;
@@ -1187,6 +1206,20 @@ async function main() {
       return cleaned.length > 0 ? cleaned : null;
     }
 
+    /**
+     * 剥离所有 ｜｜DSML｜｜ 标签（开/闭、配对/孤立、正反斜杠），
+     * 避免任何残缺的工具调用标签被当作正文返回给客户端
+     */
+    function stripDsmlTags(text) {
+      if (!text) return text;
+      return text
+        // 1. 跨行的配对块：<｜｜DSML｜｜ xxx>...</｜｜DSML｜｜ xxx>（含 calls / invoke / parameter 等）
+        .replace(/<[\\/]?｜｜DSML｜｜[^>]*>[\s\S]*?<\/[\\/]?｜｜DSML｜｜[^>]*>/g, '')
+        // 2. 残余的孤立开/闭标签（含斜杠畸形）
+        .replace(/<[\\/]?｜｜DSML｜｜[^>]*>/g, '')
+        .trim();
+    }
+
     async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, cancelState, onDelta = null) {
       const hasTools = toolsText && toolsText !== '无';
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
@@ -1213,10 +1246,8 @@ async function main() {
           }
 
           if (parseResult.success) {
-            // 提取工具调用标签之外的纯文本作为助手文字说明
-            const textContent = rawOutput
-              .replace(/<｜｜DSML｜｜ calls>[\s\S]*?<\/｜｜DSML｜｜ calls>/g, '')   // 移除整个包裹块
-              .replace(/<｜｜DSML｜｜ invoke[\s\S]*?<\/｜｜DSML｜｜ invoke>/g, '')   // 兜底移除残留 invoke 块
+            // 提取工具调用标签之外的纯文本作为助手文字说明（统一走 stripDsmlTags）
+            const textContent = stripDsmlTags(rawOutput)
               .replace(/\n{3,}/g, '\n\n')                          // 压缩多余空行
               .trim();
 
@@ -1268,8 +1299,8 @@ async function main() {
               .join('\n')
               .trim();
 
-             const cleaned = cleanTaskCompletedMark(finalText);
-            return { toolCall: null, toolCalls: [], rawOutput: cleaned || rawOutput, assistantContent: null };
+             const cleaned = cleanTaskCompletedMark(stripDsmlTags(finalText));
+            return { toolCall: null, toolCalls: [], rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null };
           }
         }
       } else {
@@ -1282,8 +1313,8 @@ async function main() {
           .split('\n')
           .filter(line => !langKeywords.test(line.trim()))
           .join('\n');
-        const cleaned = cleanTaskCompletedMark(cleanText);
-        return { toolCall: null, rawOutput: cleaned || rawOutput, assistantContent: null };
+        const cleaned = cleanTaskCompletedMark(stripDsmlTags(cleanText));
+        return { toolCall: null, rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null };
       }
     }
 
