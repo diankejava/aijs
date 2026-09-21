@@ -1097,8 +1097,11 @@ async function main() {
             pValue = rawBody.slice(cdataStart, cdataEnd);
             pos = cdataEnd + ']]>'.length;
           } else {
-            // 用正则匹配闭合标签：容忍 "/" 或 "\" 甚至缺失斜杠，兼容带/不带 ｜｜DSML｜｜ 前缀
-            const closeRe = /<[\\/]?(?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?parameter>/i;
+            // 用正则匹配闭合标签：
+            //  - 若以 "/" 或 "\" 开头（真正的闭合标签），允许 parameter 后跟随任意属性后再接 ">"；
+            //    这是为了兼容模型把闭标签和下一个开标签合并写出的畸形（如 <\｜｜DSML｜｜ parameter name="offset" ...>）
+            //  - 若无斜杠，则 parameter 后必须直接 ">"（避免把合法开标签 <parameter name="xxx"> 误当闭合标签）
+            const closeRe = /(?:<[\\/](?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?parameter\b[^>]*>|<(?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?parameter>|｜｜DSML｜｜[ \t\u00A0\u3000]*parameter>)/i;
             const afterOpen = rawBody.slice(pos);
             const mc = afterOpen.match(closeRe);
             if (!mc) { break; }
