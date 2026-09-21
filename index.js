@@ -807,6 +807,13 @@ async function main() {
               i += INVOKE_OPEN.length;
               continue;
             }
+            // 兼容无 ｜｜DSML｜｜ 前缀的裸 <invoke ...>（模型偶尔退回旧格式）
+            if (rest.startsWith('<invoke')) {
+              inToolBlock = true;
+              toolBlockEnd = '</invoke>';
+              i += '<invoke'.length;
+              continue;
+            }
             // 兜底：模型漏掉开标签，但闭标签仍出现 → 直接把闭标签吃掉，不输出给客户端
             if (rest.startsWith(WRAPPED_CLOSE)) {
               i += WRAPPED_CLOSE.length;
@@ -814,6 +821,10 @@ async function main() {
             }
             if (rest.startsWith(INVOKE_CLOSE)) {
               i += INVOKE_CLOSE.length;
+              continue;
+            }
+            if (rest.startsWith('</invoke>')) {
+              i += '</invoke>'.length;
               continue;
             }
             // 跨增量前缀检测：开标签或闭标签被切碎时暂存等下一帧
@@ -834,6 +845,16 @@ async function main() {
             if (!isPrefix) {
               for (let k = 1; k < INVOKE_CLOSE.length; k++) {
                 if (rest === INVOKE_CLOSE.slice(0, k)) { isPrefix = true; break; }
+              }
+            }
+            if (!isPrefix) {
+              for (let k = 1; k < '</invoke>'.length; k++) {
+                if (rest === '</invoke>'.slice(0, k)) { isPrefix = true; break; }
+              }
+            }
+            if (!isPrefix) {
+              for (let k = 1; k < '<invoke'.length; k++) {
+                if (rest === '<invoke'.slice(0, k)) { isPrefix = true; break; }
               }
             }
             if (isPrefix) break;
@@ -1213,10 +1234,18 @@ async function main() {
     function stripDsmlTags(text) {
       if (!text) return text;
       return text
-        // 1. 跨行的配对块：<｜｜DSML｜｜ xxx>...</｜｜DSML｜｜ xxx>（含 calls / invoke / parameter 等）
+        // 1. 带 ｜｜DSML｜｜ 前缀的配对块
         .replace(/<[\\/]?｜｜DSML｜｜[^>]*>[\s\S]*?<\/[\\/]?｜｜DSML｜｜[^>]*>/g, '')
-        // 2. 残余的孤立开/闭标签（含斜杠畸形）
+        // 2. 无前缀的旧格式配对块：<invoke ...> ... </invoke>
+        .replace(/<invoke\b[^>]*>[\s\S]*?<\/invoke>/gi, '')
+        // 3. 无前缀的 <parameter> 残留（模型可能只写参数块）
+        .replace(/<parameter\b[^>]*>[\s\S]*?<\/parameter>/gi, '')
+        // 4. 残余的孤立标签（带 ｜｜DSML｜｜ 前缀）
         .replace(/<[\\/]?｜｜DSML｜｜[^>]*>/g, '')
+        // 5. 残余的孤立标签（无前缀，正/反/无斜杠都吃掉）
+        .replace(/<[\\/]?\s*\/?\s*invoke\b[^>]*>/gi, '')
+        .replace(/<[\\/]?\s*\/?\s*parameter\b[^>]*>/gi, '')
+        .replace(/<[\\/]?\s*\/?\s*calls\b[^>]*>/gi, '')
         .trim();
     }
 
@@ -1465,22 +1494,46 @@ async function main() {
                 choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }]
               })}\n\n`);
 
-              const onDelta = (delta) => {
-                if (!responseEnded && res.writable) {
-                  res.write(`data: ${JSON.stringify({
-                    id: chunkId, object: 'chat.completion.chunk', created, model,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
-                  })}\n\n`);
+              // 流式剥离 <...>：用一个缓冲区处理跨 chunk 的"半个标签"
+              let streamBuf = '';
+              const flushStream = (force = false) => {
+                if (responseEnded || !res.writable || !streamBuf) return;
+                // 尾部若以未闭合的 '<' 结尾：
+                //   - 非 force：暂存到下次，等下一帧补全
+                //   - force：直接丢弃这半截，不再保留
+                const ltIdx = streamBuf.lastIndexOf('<');
+                const gtIdx = streamBuf.lastIndexOf('>');
+                let toEmit;
+                if (ltIdx > gtIdx) {
+                  toEmit = streamBuf.slice(0, ltIdx);
+                  streamBuf = force ? '' : streamBuf.slice(ltIdx);
+                } else {
+                  toEmit = streamBuf;
+                  streamBuf = '';
                 }
+                // 剥离所有 <...>
+                const cleaned = toEmit.replace(/<[^>]*>/g, '');
+                if (!cleaned) return;
+                res.write(`data: ${JSON.stringify({
+                  id: chunkId, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }]
+                })}\n\n`);
+              };
+              const onDelta = (delta) => {
+                if (responseEnded || !res.writable) return;
+                streamBuf += delta;
+                flushStream(false);
               };
 
-              streamCtx = { isEnded: () => responseEnded, chunkId, model, created, onDelta };
+              streamCtx = { isEnded: () => responseEnded, chunkId, model, created, onDelta, flushStream };
             }
 
             // 真正流式：无工具 + 流式请求时，正文边接收边返回
             if (data.stream === true && tools.length === 0) {
               const streamPrompt = `【可用工具】\n无\n\n${promptText}`;
               await sendAndWait(streamPrompt, cancelState, streamCtx.onDelta);
+              // ★ 把流式缓冲区里最后的内容吐出来（尾部半截 '<...' 会被强制丢弃）
+              try { streamCtx.flushStream(true); } catch (_) {}
               if (!streamCtx.isEnded() && res.writable) {
                 res.write(`data: ${JSON.stringify({
                   id: streamCtx.chunkId, object: 'chat.completion.chunk', created: streamCtx.created, model: streamCtx.model,
@@ -1564,6 +1617,7 @@ async function main() {
               const { chunkId, model, created, isEnded } = streamCtx;
               const alive = () => !isEnded() && res.writable;
 
+              try { streamCtx.flushStream(true); } catch (_) {}
               if (hasTool) {
                 // 正文说明已通过 onDelta 流式输出，这里只发送工具调用块
                 for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
