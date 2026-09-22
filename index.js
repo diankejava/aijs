@@ -696,6 +696,41 @@ async function main() {
       } catch (e) {
         console.log('[HTTP] 专家模式切换异常:', e.message);
       }
+
+            // ★ 如果"智能搜索"处于开启状态，关掉它
+      try {
+        // 用 Playwright 的 hasText 过滤器（不是 CSS 伪类），能正确匹配 <div class="ds-toggle-button">智能搜索</div>
+        let searchBtn = page.locator('.ds-toggle-button', { hasText: '智能搜索' }).first();
+        if (await searchBtn.count() === 0) {
+          // 兜底：类名或文案可能不同
+          searchBtn = page.locator('.ds-toggle-button', { hasText: '联网搜索' }).first();
+        }
+        if (await searchBtn.count() === 0) {
+          searchBtn = page.locator('[aria-pressed]', { hasText: '智能搜索' }).first();
+        }
+
+        if (await searchBtn.count() > 0 && await searchBtn.isVisible()) {
+          const pressed = (await searchBtn.getAttribute('aria-pressed') || '').toLowerCase();
+          const cls = (await searchBtn.getAttribute('class') || '');
+          const isOn = pressed === 'true' || /ds-toggle-button--selected/i.test(cls);
+
+          console.log('[HTTP][诊断] 智能搜索按钮: aria-pressed=' + pressed + ', isOn=' + isOn);
+
+          if (isOn) {
+            await searchBtn.click();
+            await page.waitForTimeout(500);
+            // 二次确认
+            const afterPressed = (await searchBtn.getAttribute('aria-pressed') || '').toLowerCase();
+            console.log('[HTTP] 已点击智能搜索，点击后 aria-pressed=' + afterPressed);
+          } else {
+            console.log('[HTTP] 智能搜索未开启，无需处理');
+          }
+        } else {
+          console.log('[HTTP] 未找到智能搜索按钮');
+        }
+      } catch (e) {
+        console.log('[HTTP] 智能搜索切换异常:', e.message);
+      }
     }
 
     // ========== 稳健输入策略：优先 insertText，降级为增强 DOM 注入（支持换行） ==========
