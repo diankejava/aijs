@@ -317,272 +317,6 @@ async function main() {
     return false;
   }
 
-  // 提取最后一条 AI 回复（不依赖剪贴板，直接用 textContent 保留缩进与换行）
-  async function extractLastReply() {
-    try {
-        return await page.evaluate(() => {
-            const items = document.querySelectorAll('[data-virtual-list-item-key]');
-            if (!items.length) return '';
-            const last = items[items.length - 1];
-            const main = last.querySelector('.ds-assistant-message-main-content');
-            if (!main) return '';
-
-            // 遍历 DOM：文本节点取原文（保留缩进/内联换行），块级元素之后补一个换行
-            const BLOCK = new Set(['P', 'DIV', 'PRE', 'UL', 'OL', 'LI', 'TABLE', 'TR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'BR', 'HR']);
-            const walk = (node) => {
-                let out = '';
-                for (const c of node.childNodes) {
-                    if (c.nodeType === 3) {
-                        out += c.textContent;
-                    } else if (c.nodeType === 1) {
-                        out += walk(c);
-                        if (BLOCK.has(c.tagName)) out += '\n';
-                    }
-                }
-                return out;
-            };
-
-            let text = walk(main).replace(/\n{3,}/g, '\n\n').trim();
-
-            // 降级：walk（textContent）提取为空时，回退用 innerText（渲染文本）兜底
-            if (!text) {
-                text = (main.innerText || '').trim();
-            }
-
-            // 只拦截行首的英文对话历史标记（如 "User: xxx"），避免误伤代码里的 DeptUser::getSn 等双冒号方法引用
-            if (/^(User|Assistant)\s*:/m.test(text)) return '';
-
-            // 过滤 UI 杂讯：语言标签、代码块操作按钮（仅当独占一行时删除，避免误删正文）
-            const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c)$/i;
-            const uiNoise = /^(复制|下载|运行|调试|代码)$/;
-            text = text
-                .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-                .split('\n')
-                .filter(line => {
-                    const t = line.trim();
-                    return t !== '' && !langKeywords.test(t) && !uiNoise.test(t);
-                })
-                .join('\n');
-
-            return text;
-        });
-    } catch (e) {
-        return '';
-    }
-  }
-
-  // 检测错误文本（限制搜索范围为 Toast/通知区域，避免误判 AI 回复内容）
-  async function detectErrorText() {
-    const errorPatterns = [
-      'Something went wrong', 'An error occurred',
-      'failed to generate', 'response was cut off', 'timed out',
-      'Server busy', 'please try again', 'unavailable'
-    ];
-    try {
-      // 优先搜索 Toast/通知容器，降级为 body
-      const containers = await page.$$('.ds-toast, .ds-message, .ds-notification, .ds-alert, [class*="snackbar"]');
-      let searchText = '';
-      if (containers.length > 0) {
-        for (const c of containers) {
-          try { searchText += await c.innerText({ timeout: 1000 }); } catch (e) { }
-        }
-      } else {
-        searchText = await page.locator('body').innerText({ timeout: 3000 });
-      }
-      for (const pattern of errorPatterns) {
-        if (searchText.includes(pattern)) {
-          // console.log('[重试检测] 发现错误提示: "' + pattern + '"');
-          return true;
-        }
-      }
-    } catch (e) { }
-    return false;
-  }
-
-  // 带重试检测的 waitForReply
-  async function waitForReply(cancelState = null) {
-    console.log('[DEBUG] 等待 AI 回复（支持重试检测）...');
-    // const startTime = Date.now();
-    let lastRetryCheck = 0;
-    let emptyReplyCount = 0; // 连续"正文为空"计数，防止死循环
-
-    while (true) {
-      try {
-        // ★ 超时或其他必要取消时才会触发
-        if (cancelState && cancelState.cancelled) {
-            console.log('[DEBUG] 任务已取消，终止等待');
-            return null;
-        }
-
-        // ===== 1. 优先检查是否已有完整回复（无论页面是否显示错误） =====
-        const found = await page.evaluate(() => {
-          const items = document.querySelectorAll('[data-virtual-list-item-key]');
-          if (!items.length) return false;
-          const last = items[items.length - 1];
-          const main = last.querySelector('.ds-assistant-message-main-content');
-          const flex = last.querySelector('.ds-flex');
-          // 要求正文容器存在、操作栏出现、且正文非空。
-          // 否则深度思考（R1）时容器已建但正文未输出，会被过早判定为完成。
-          // 用 textContent 判断（与 extractLastReply 的 walk 基于同一数据源），避免两者不一致导致死循环。
-          return !!(main && flex && main.textContent && main.textContent.trim());
-        });
-
-        // 2. 检查发送按钮是否已经恢复为非停止状态
-        let sendBtnReady = false;
-        const sendBtn = await findSendButton();
-        if (sendBtn) {
-            try {
-                sendBtnReady = await sendBtn.evaluate(el => {
-                    const text = (el.textContent || '').trim();
-                    const ariaLabel = (el.getAttribute('aria-label') || '').trim();
-                    const isStop = /停止|stop|halt/i.test(text + ariaLabel);
-                    return !el.disabled && !isStop;
-                });
-            } catch (e) {
-                // 如果按钮不可访问，忽略
-            }
-        }
-
-        if (found && sendBtnReady) {
-          console.log('[DEBUG] 检测到完成信号，提取回复...');
-          await page.waitForTimeout(300);
-
-          let reply = await extractLastReply();
-
-          if (!reply) {
-            await page.waitForTimeout(500);
-            reply = await extractLastReply();
-          }
-
-          if (reply) {
-            console.log('[DEBUG] 成功提取回复，长度:', reply.length);
-            return reply;
-          }
-
-          // 完成信号已出现但正文仍为空（深度思考/正文尚未输出完），继续等待而非直接返回空
-          emptyReplyCount++;
-          console.log(`[DEBUG] 完成信号已出现但正文为空 (${emptyReplyCount}/20)，继续等待正文输出...`);
-
-          // 诊断：输出 main 的 innerText/textContent，帮助定位提取失败原因
-          try {
-            const diag = await page.evaluate(() => {
-              const items = document.querySelectorAll('[data-virtual-list-item-key]');
-              if (!items.length) return { items: 0 };
-              const last = items[items.length - 1];
-              const main = last.querySelector('.ds-assistant-message-main-content');
-              return {
-                items: items.length,
-                hasMain: !!main,
-                innerText: main ? (main.innerText || '').slice(0, 120) : '',
-                textContent: main ? (main.textContent || '').slice(0, 120) : '',
-              };
-            });
-            console.log('[DEBUG][诊断]', JSON.stringify(diag));
-          } catch (e) {}
-
-          // 超过上限：降级用 innerText 直接返回，避免死循环
-          if (emptyReplyCount >= 20) {
-            console.log('[DEBUG] 连续正文为空超过上限，降级用 innerText 提取...');
-            const fallback = await page.evaluate(() => {
-              const items = document.querySelectorAll('[data-virtual-list-item-key]');
-              if (!items.length) return '';
-              const last = items[items.length - 1];
-              const main = last.querySelector('.ds-assistant-message-main-content');
-              return main ? (main.innerText || '').trim() : '';
-            });
-            if (fallback) {
-              console.log('[DEBUG] 降级提取成功，长度:', fallback.length);
-              return fallback;
-            }
-            console.log('[DEBUG] 降级提取也为空，放弃等待');
-            return '';
-          }
-
-          await page.waitForTimeout(1500);
-          continue;
-        }
-
-        // ===== 2. 没有完成信号时才进行重试/错误处理（降低检查频率） =====
-        if (Date.now() - lastRetryCheck > 3000) {
-          lastRetryCheck = Date.now();
-
-          const retryBtn = await detectRetryButton();
-          if (retryBtn) {
-            console.log('[重试] 检测到重试按钮，自动点击...');
-            try {
-              await retryBtn.click();
-              console.log('[重试] 已点击重试按钮，继续等待...');
-            } catch (e) {
-              console.log('[重试] 点击重试按钮失败:', e.message);
-            }
-            await page.waitForTimeout(1000);
-            continue;
-          }
-
-          const hasError = await detectErrorText();
-          if (hasError) {
-            // 仅记录，不进行长时间等待，立即回到循环开头重新检查完成信号
-            // console.log('[重试] 检测到错误提示，继续等待模型回复...');
-            // 极短延迟避免高频轮询，但很快再次检查
-            await page.waitForTimeout(500);
-            continue;
-          }
-        }
-
-        // ===== 3. 正常轮询间隔 =====
-        await page.waitForTimeout(1000);
-
-      } catch (e) {
-        if (e.message && e.message.includes('Execution context')) {
-          console.log('[DEBUG] 页面上下文失效，等待稳定...');
-          await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
-        } else {
-          console.log('[DEBUG] 轮询异常:', e.message);
-        }
-        await page.waitForTimeout(1000);
-      }
-    }
-  }
-
-  // 解析 DeepSeek SSE 响应，提取 RESPONSE（正文）的完整原始文本
-  function parseSSE(body) {
-    let lastPath = '';
-    let lastOp = '';
-    let inResponse = false;
-    let content = '';
-
-    const lines = body.split('\n');
-    for (const line of lines) {
-      if (!line.startsWith('data:')) continue;
-      const dataStr = line.slice(5).trim();
-      if (!dataStr.startsWith('{')) continue;
-      let d;
-      try { d = JSON.parse(dataStr); } catch (e) { continue; }
-
-      if (d.p) lastPath = d.p;
-      if (d.o) lastOp = d.o;
-
-      // 追加新 fragment（RESPONSE 为正文）
-      if (lastPath === 'response/fragments' && lastOp === 'APPEND' && Array.isArray(d.v)) {
-        for (const f of d.v) {
-          if (f && f.type === 'RESPONSE') {
-            inResponse = true;
-            if (typeof f.content === 'string') content += f.content;
-          }
-        }
-        continue;
-      }
-
-      // 流式累积正文 content（-1 指向当前最后一个 fragment）
-      if (lastPath === 'response/fragments/-1/content' && inResponse) {
-        if (typeof d.v === 'string') content += d.v;
-        continue;
-      }
-    }
-
-    return content;
-  }
-
   // 流式 SSE 解析器：处理增量 chunk，实时提取 RESPONSE（正文）增量；RESPONSE 空时用 THINK 兜底
   function createSSEParser(onResponseDelta, onFinished, onLimitExceeded) {
     let buffer = '';
@@ -697,7 +431,7 @@ async function main() {
         console.log('[HTTP] 专家模式切换异常:', e.message);
       }
 
-            // ★ 如果"智能搜索"处于开启状态，关掉它
+      // ★ 如果"智能搜索"处于开启状态，关掉它
       try {
         // 用 Playwright 的 hasText 过滤器（不是 CSS 伪类），能正确匹配 <div class="ds-toggle-button">智能搜索</div>
         let searchBtn = page.locator('.ds-toggle-button', { hasText: '智能搜索' }).first();
@@ -813,105 +547,118 @@ async function main() {
     let toolBlockEnd = '';     // 当前工具块的结束标记
     let outputLen = 0;         // 已通过 onDelta 输出的长度（fullContent 的索引）
     let limitExceeded = false; // 是否检测到"对话长度上限"错误
+
+    // ★ 工具标签的宽容正则：放在 delta 回调之外，避免每次 delta 都重建
+    // 兼容任意噪声前缀（DSML、全角/半角竖线、空格等），无论噪声与 "<" 是否跨 chunk
+    const TAG_NOISE_STR = '(?:DSML|[^a-zA-Z0-9_/>])*';
+    const RE_CALLS_OPEN    = new RegExp('^<'  + TAG_NOISE_STR + 'calls(?=[\\s>])',        'i');
+    const RE_CALLS_CLOSE   = new RegExp('^</' + TAG_NOISE_STR + 'calls(?=[\\s>])',        'i');
+    const RE_INVOKE_OPEN   = new RegExp('^<'  + TAG_NOISE_STR + 'invoke(?=[\\s>])',       'i');
+    const RE_INVOKE_CLOSE  = new RegExp('^</' + TAG_NOISE_STR + 'invoke[^>]*>',           'i');
+    const RE_PARAM_OPEN    = new RegExp('^<'  + TAG_NOISE_STR + 'parameter\\b[^>]*>',     'i');
+    const RE_PARAM_CLOSE   = new RegExp('^</' + TAG_NOISE_STR + 'parameter(?=[\\s>])[^>]*>', 'i');
+
+    // 判断 rest 是否是某个工具标签的前缀（跨增量缓冲用）
+     const isToolTagPrefix = (s) => {
+      if (!s || s[0] !== '<') return false;
+      let idx = 1;
+      if (s[idx] === '/') idx++;
+      while (idx < s.length) {
+        if (s.startsWith('DSML', idx)) { idx += 4; continue; }
+        if (!/[a-zA-Z0-9_/>]/.test(s[idx])) { idx++; continue; }
+        // ★ 若 s.slice(idx) 恰好是 "DSML" 的某个前缀（D / DS / DSM / S / SM / SML / M / ML / L），
+        //    说明 DSML 字面量还没收完，缓冲等待
+        const remain = s.slice(idx);
+        if (remain.length <= 4 && 'DSML'.startsWith(remain)) return true;
+        break;
+      }
+      if (idx >= s.length) return true; // 全是噪声，等待标签名
+      const tail = s.slice(idx);
+      for (const tag of ['calls', 'invoke', 'parameter']) {
+        if (tail.length <= tag.length) {
+          if (tag.slice(0, tail.length) === tail) return true;
+        } else if (tail.startsWith(tag)) {
+          const next = tail[tag.length];
+          if (!/[a-zA-Z0-9_]/.test(next)) return true;
+        }
+      }
+      return false;
+    };
+
     const parser = createSSEParser(
             (delta) => {
         fullContent += delta;
-
-        const WRAPPED_OPEN  = '<｜｜DSML｜｜ calls>';
-        const WRAPPED_CLOSE = '</｜｜DSML｜｜ calls>';
-        const INVOKE_OPEN   = '<｜｜DSML｜｜ invoke';
-        const INVOKE_CLOSE  = '</｜｜DSML｜｜ invoke>';
 
         // 逐段扫描新增部分，输出工具调用块之外的文本，跳过块内内容
         let out = '';
         let i = outputLen;
         while (i < fullContent.length) {
           const rest = fullContent.slice(i);
+
+          // ★ 先吃掉任何残留的闭合标签（无论是否在块内）
+          // 注意：</parameter> 必须放在最前，因为 invoke/calls 块内也可能出现它
+          const strayParamClose = rest.match(RE_PARAM_CLOSE);
+          if (strayParamClose) {
+            i += strayParamClose[0].length;
+            // 孤儿 parameter 块：遇到 </parameter> 即退出
+            if (inToolBlock && toolBlockEnd === 'parameter') { inToolBlock = false; toolBlockEnd = ''; }
+            continue;
+          }
+          const strayCallsClose = rest.match(RE_CALLS_CLOSE);
+          if (strayCallsClose) {
+            i += strayCallsClose[0].length;
+            if (inToolBlock && toolBlockEnd === 'calls') { inToolBlock = false; toolBlockEnd = ''; }
+            continue;
+          }
+          const strayInvokeClose = rest.match(RE_INVOKE_CLOSE);
+          if (strayInvokeClose) {
+            i += strayInvokeClose[0].length;
+            if (inToolBlock && toolBlockEnd === 'invoke') { inToolBlock = false; toolBlockEnd = ''; }
+            continue;
+          }
+
           if (!inToolBlock) {
-            // 进入 <｜｜DSML｜｜ calls> 包裹块（新格式）
-            if (rest.startsWith(WRAPPED_OPEN)) {
+            // 进入 <... calls>（含 DSML 或纯竖线噪声）
+            const callsOpen = rest.match(RE_CALLS_OPEN);
+            if (callsOpen) {
               inToolBlock = true;
-              toolBlockEnd = WRAPPED_CLOSE;
-              i += WRAPPED_OPEN.length;
+              toolBlockEnd = 'calls';
+              i += callsOpen[0].length;
               continue;
             }
-            // 兼容裸 <｜｜DSML｜｜ invoke>（无包裹的旧/异常输出）
-            if (rest.startsWith(INVOKE_OPEN)) {
+            // 进入 <... invoke>（无 calls 包裹的异常输出）
+            const invokeOpen = rest.match(RE_INVOKE_OPEN);
+            if (invokeOpen) {
               inToolBlock = true;
-              toolBlockEnd = INVOKE_CLOSE;
-              i += INVOKE_OPEN.length;
+              toolBlockEnd = 'invoke';
+              i += invokeOpen[0].length;
               continue;
             }
-            // 兼容无 ｜｜DSML｜｜ 前缀的裸 <invoke ...>（模型偶尔退回旧格式）
-            if (rest.startsWith('<invoke')) {
+            // 孤儿 <... parameter>（模型漏了 invoke 包裹）——进入吞掉模式
+            const paramOpen = rest.match(RE_PARAM_OPEN);
+            if (paramOpen) {
               inToolBlock = true;
-              toolBlockEnd = '</invoke>';
-              i += '<invoke'.length;
+              toolBlockEnd = 'parameter';
+              i += paramOpen[0].length;
               continue;
             }
-            // 兜底：模型漏掉开标签，但闭标签仍出现 → 直接把闭标签吃掉，不输出给客户端
-            if (rest.startsWith(WRAPPED_CLOSE)) {
-              i += WRAPPED_CLOSE.length;
-              continue;
-            }
-            if (rest.startsWith(INVOKE_CLOSE)) {
-              i += INVOKE_CLOSE.length;
-              continue;
-            }
-            if (rest.startsWith('</invoke>')) {
-              i += '</invoke>'.length;
-              continue;
-            }
-            // 跨增量前缀检测：开标签或闭标签被切碎时暂存等下一帧
-            let isPrefix = false;
-            for (let k = 1; k < WRAPPED_OPEN.length; k++) {
-              if (rest === WRAPPED_OPEN.slice(0, k)) { isPrefix = true; break; }
-            }
-            if (!isPrefix) {
-              for (let k = 1; k < INVOKE_OPEN.length; k++) {
-                if (rest === INVOKE_OPEN.slice(0, k)) { isPrefix = true; break; }
-              }
-            }
-            if (!isPrefix) {
-              for (let k = 1; k < WRAPPED_CLOSE.length; k++) {
-                if (rest === WRAPPED_CLOSE.slice(0, k)) { isPrefix = true; break; }
-              }
-            }
-            if (!isPrefix) {
-              for (let k = 1; k < INVOKE_CLOSE.length; k++) {
-                if (rest === INVOKE_CLOSE.slice(0, k)) { isPrefix = true; break; }
-              }
-            }
-            if (!isPrefix) {
-              for (let k = 1; k < '</invoke>'.length; k++) {
-                if (rest === '</invoke>'.slice(0, k)) { isPrefix = true; break; }
-              }
-            }
-            if (!isPrefix) {
-              for (let k = 1; k < '<invoke'.length; k++) {
-                if (rest === '<invoke'.slice(0, k)) { isPrefix = true; break; }
-              }
-            }
-            if (isPrefix) break;
+
+            // 跨增量缓冲
+            if (isToolTagPrefix(rest)) break;
 
             out += fullContent[i];
             i++;
           } else {
-            // 工具调用块内：等待结束标记
-            if (toolBlockEnd && rest.startsWith(toolBlockEnd)) {
-              i += toolBlockEnd.length;
-              inToolBlock = false;
-              toolBlockEnd = '';
+            // 块内：跟踪嵌套开标签（parameter 计数）
+            const paramOpen = rest.match(RE_PARAM_OPEN);
+            if (paramOpen) {
+              i += paramOpen[0].length;
               continue;
             }
-            // 跨增量前缀检测：结束标记可能被切碎（如 "</｜｜DSML｜｜ calls" + ">xxx"），
-            // 若当前 rest 恰好是 toolBlockEnd 的前缀，暂停等待下一个增量补全，避免误吃正文
-            let endIsPrefix = false;
-            for (let k = 1; k < toolBlockEnd.length; k++) {
-              if (rest === toolBlockEnd.slice(0, k)) { endIsPrefix = true; break; }
-            }
-            if (endIsPrefix) break;
-            // 块内内容一律跳过（不流式输出）
+            // 闭合标签（calls/invoke/parameter）已在循环开头由 stray*Close 分支统一处理，
+            // 能走到这里说明就是块内的普通内容，直接跳过
+            if (isToolTagPrefix(rest)) break;
+            // 块内内容一律跳过
             i++;
           }
         }
@@ -1078,15 +825,32 @@ async function main() {
     function parseToolCall(text, allowedNames = []) {
       if (!text) return { found: false, success: false, toolCalls: [], toolCall: null };
 
-      // 清理零宽字符（模型偶尔在标签 < 后混入零宽字符，显示为 <zwnj; 之类，导致 <invoke/<parameter 无法匹配）
-      text = text.replace(/[​‌‍⁠﻿]/g, '')
-                 .replace(/&(?:zwnj|zwj|lrm|rlm);/gi, '')
-                 .replace(/<z(?:wnj|wj)/gi, '<');
+      // 清理零宽字符、HTML 实体、<zwnj 字面量
+      text = text
+        .replace(/[​‌‍⁠﻿]/g, '')
+        .replace(/&(?:zwnj|zwj|lrm|rlm);/gi, '')
+        .replace(/<z(?:wnj|wj)/gi, '<');
+
+      // ★ 清洗工具标签前的异常前缀，兼容模型输出的各种噪声形态：
+      //   DSML 字面量、全角/半角竖线、空格、以及这些的任意组合和变体
+      //   （例：<｜｜DSML｜｜ parameter>、</｜DSML｜ invoke>、<｜｜｜｜ calls>、
+      //        <∣DSML∣ invoke> 等 —— 不再枚举竖线变体，用排除法统一处理）
+      //   - TAG_NOISE 用 (?:DSML|[^a-zA-Z0-9_/>])* 覆盖：DSML 整体识别，
+      //     其他任何非字母数字下划线斜杠尖括号的字符都被当作噪声
+      //   - (?=[\s>]) 保证标签名后紧邻空格或 >，避免误伤 <parameters>、<callstate> 之类
+      const TAG_NOISE = '(?:DSML|[^a-zA-Z0-9_/>])*';
+      text = text.replace(
+        new RegExp('(<\\/?)' + TAG_NOISE + '(calls|invoke|parameter)(?=[\\s>])', 'gi'),
+        '$1$2'
+      );
+
+      // 兜底：清掉标签外可能残留的 DSML 字面量
+      text = text.replace(/DSML/gi, '');
 
       const results = [];
 
       // 正则匹配完整的 <invoke name="函数名"> ... </invoke>（支持换行、多个参数）
-      const invokeRegex = /<(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?invoke\s+name\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?invoke>/gi;
+      const invokeRegex = /<invoke\s+name\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/invoke>/gi;
       let match;
       while ((match = invokeRegex.exec(text)) !== null) {
         const rawName = match[1].trim();
@@ -1113,7 +877,7 @@ async function main() {
 
         // 解析 <parameter name="参数名">参数值</parameter>（手动解析，CDATA 感知：CDATA 包裹的内容一律当作值，不当标签）
         const args = {};
-        const paramOpenRegex = /<(?:｜｜DSML｜｜[ \t\u00A0\u3000]+)?parameter\s+name\s*=\s*"([^"]*)"[^>]*>/gi;
+        const paramOpenRegex = /<parameter\s+name\s*=\s*"([^"]*)"[^>]*>/gi;
         let pm;
         while ((pm = paramOpenRegex.exec(rawBody)) !== null) {
           const pName = pm[1].trim();
@@ -1136,7 +900,7 @@ async function main() {
             //  - 若以 "/" 或 "\" 开头（真正的闭合标签），允许 parameter 后跟随任意属性后再接 ">"；
             //    这是为了兼容模型把闭标签和下一个开标签合并写出的畸形（如 <\｜｜DSML｜｜ parameter name="offset" ...>）
             //  - 若无斜杠，则 parameter 后必须直接 ">"（避免把合法开标签 <parameter name="xxx"> 误当闭合标签）
-            const closeRe = /(?:<[\\/](?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?parameter\b[^>]*>|<(?:｜｜DSML｜｜[ \t\u00A0\u3000]*)?parameter>|｜｜DSML｜｜[ \t\u00A0\u3000]*parameter>)/i;
+            const closeRe = /(?:<[\\/]parameter\b[^>]*>|<parameter>|<[\\/]parameter>)/i;
             const afterOpen = rawBody.slice(pos);
             const mc = afterOpen.match(closeRe);
             if (!mc) { break; }
@@ -1257,10 +1021,12 @@ async function main() {
      * @returns {string|null} 清洗后的有效文本，若为空则返回 null
      */
     function cleanTaskCompletedMark(text) {
-      text = text.replace(/<[^>]*>/g, '');
-
       if (!text) return null;
-      // 去除首尾空白
+      // 只清理工具调用相关的标签（含噪声前缀变体），保留正文里可能出现的 HTML
+      const N = '(?:DSML|[^a-zA-Z0-9_/>])*';
+      text = text
+        .replace(new RegExp('</?' + N + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+        .replace(/DSML/gi, '');
       const cleaned = text.trim();
       return cleaned.length > 0 ? cleaned : null;
     }
@@ -1271,28 +1037,24 @@ async function main() {
      */
     function stripDsmlTags(text) {
       if (!text) return text;
+      // 统一噪声类：DSML 整体识别 + 任意非字母数字下划线斜杠尖括号的字符
+      const N = '(?:DSML|[^a-zA-Z0-9_/>])*';
       return text
-        // 1. 带 ｜｜DSML｜｜ 前缀的配对块
-        .replace(/<[\\/]?｜｜DSML｜｜[^>]*>[\s\S]*?<\/[\\/]?｜｜DSML｜｜[^>]*>/g, '')
-        // 2. 无前缀的旧格式配对块：<invoke ...> ... </invoke>
-        .replace(/<invoke\b[^>]*>[\s\S]*?<\/invoke>/gi, '')
-        // 3. 无前缀的 <parameter> 残留（模型可能只写参数块）
-        .replace(/<parameter\b[^>]*>[\s\S]*?<\/parameter>/gi, '')
-        // 4. 残余的孤立标签（带 ｜｜DSML｜｜ 前缀）
-        .replace(/<[\\/]?｜｜DSML｜｜[^>]*>/g, '')
-        // 5. 残余的孤立标签（无前缀，正/反/无斜杠都吃掉）
-        .replace(/<[\\/]?\s*\/?\s*invoke\b[^>]*>/gi, '')
-        .replace(/<[\\/]?\s*\/?\s*parameter\b[^>]*>/gi, '')
-        .replace(/<[\\/]?\s*\/?\s*calls\b[^>]*>/gi, '')
+        // 1. 配对块（开/闭标签名前都允许任意噪声）
+        .replace(new RegExp('<' + N + '(?:invoke|parameter|calls)\\b[^>]*>[\\s\\S]*?<\\/' + N + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+        // 2. 残余的孤立标签（含反斜杠变体）
+        .replace(new RegExp('</?' + N + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+        // 3. 纯 parameter 开标签（模型漏写 invoke 包裹时）
+        .replace(new RegExp('<' + N + 'parameter\\b[^>]*>', 'gi'), '')
+        // 4. 清理可能残留的 DSML 字面量
+        .replace(/DSML/gi, '')
         .trim();
     }
 
     async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, cancelState, onDelta = null) {
-      const hasTools = toolsText && toolsText !== '无';
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
       let reply = await sendAndWait(prompt, cancelState, onDelta);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
-      const firstOutput = rawOutput; // 保存模型第一次的原始回答，作为回退使用
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
 
       let parseResult = parseToolCall(rawOutput, toolNames);
@@ -1358,11 +1120,14 @@ async function main() {
             // 模型拒绝输出工具调用，将当前文本作为最终回复返回
             console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
             const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
+            const uiNoise = /^(复制|下载|运行|调试|代码)$/;
             let finalText = rawOutput
               .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-              .replace(/(复制|下载|运行|调试|代码)/g, '')
               .split('\n')
-              .filter(line => !langKeywords.test(line.trim()))
+              .filter(line => {
+                const t = line.trim();
+                return t !== '' && !langKeywords.test(t) && !uiNoise.test(t);
+              })
               .join('\n')
               .trim();
 
@@ -1374,11 +1139,14 @@ async function main() {
         // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
         // 清洗 UI 杂讯，仅在纯文本模式下进行
         const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
+        const uiNoise = /^(复制|下载|运行|调试|代码)$/;
         let cleanText = rawOutput
           .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-          .replace(/(复制|下载|运行|调试|代码)/g, '')
           .split('\n')
-          .filter(line => !langKeywords.test(line.trim()))
+          .filter(line => {
+            const t = line.trim();
+            return t !== '' && !langKeywords.test(t) && !uiNoise.test(t);
+          })
           .join('\n');
         const cleaned = cleanTaskCompletedMark(stripDsmlTags(cleanText));
         return { toolCall: null, rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null };
@@ -1454,13 +1222,16 @@ async function main() {
 
             const MAX_HISTORY = 20;
             const recentMessages = messages.slice(-MAX_HISTORY);
+            const historyNoise = /^(复制|下载|运行|调试|代码)$/;
             let promptText = "";
             for (const msg of recentMessages) {
               let rawContent = extractTextContent(msg.content);
-              // 只清洗 assistant 消息中的 UI 杂讯，保护工具返回的原始文件内容
+              // 只清洗 assistant 消息中的 UI 杂讯（行级过滤，避免误删正文中的"代码""运行"等词）
               if (msg.role === 'assistant') {
                 rawContent = rawContent
-                  .replace(/(复制|下载|运行|调试|代码)/g, '');
+                  .split('\n')
+                  .filter(line => !historyNoise.test(line.trim()))
+                  .join('\n');
               }
               const content = rawContent.slice(0, 2000);
               if (msg.role === 'system') {
@@ -1473,7 +1244,6 @@ async function main() {
                 promptText += `【工具信息】\n${content}`;
               }
             }
-
 
             console.log('[HTTP] 收到消息:', userMsg.slice(0, 50), '...');
 
@@ -1536,21 +1306,27 @@ async function main() {
               let streamBuf = '';
               const flushStream = (force = false) => {
                 if (responseEnded || !res.writable || !streamBuf) return;
-                // 尾部若以未闭合的 '<' 结尾：
+                // 尾部若存在未闭合的 '<'，从"最靠前的那个未闭合 '<'"开始暂存，
+                // 避免多个未闭合标签时前面的半截被误 emit
                 //   - 非 force：暂存到下次，等下一帧补全
-                //   - force：直接丢弃这半截，不再保留
-                const ltIdx = streamBuf.lastIndexOf('<');
+                //   - force：直接丢弃半截
                 const gtIdx = streamBuf.lastIndexOf('>');
+                const tail = streamBuf.slice(gtIdx + 1);
+                const firstLtInTail = tail.indexOf('<');
                 let toEmit;
-                if (ltIdx > gtIdx) {
-                  toEmit = streamBuf.slice(0, ltIdx);
-                  streamBuf = force ? '' : streamBuf.slice(ltIdx);
+                if (firstLtInTail !== -1) {
+                  const cutIdx = gtIdx + 1 + firstLtInTail;
+                  toEmit = streamBuf.slice(0, cutIdx);
+                  streamBuf = force ? '' : streamBuf.slice(cutIdx);
                 } else {
                   toEmit = streamBuf;
                   streamBuf = '';
                 }
-                // 剥离所有 <...>
-                const cleaned = toEmit.replace(/<[^>]*>/g, '');
+                // 只剥离工具调用相关标签（含噪声前缀变体），避免误伤正文里的 HTML
+                const N = '(?:DSML|[^a-zA-Z0-9_/>])*';
+                const cleaned = toEmit
+                  .replace(new RegExp('</?' + N + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+                  .replace(/DSML/gi, '');
                 if (!cleaned) return;
                 res.write(`data: ${JSON.stringify({
                   id: chunkId, object: 'chat.completion.chunk', created, model,
