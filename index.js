@@ -316,6 +316,26 @@ async function main() {
     }
     return false;
   }
+  // ★ 主动开启新对话（不依赖"达到对话长度上限"提示），用于死循环重置
+  async function startNewChatIfPossible() {
+    try {
+      const newChatBtn = page.locator('button:has-text("开启新对话"), [role="button"]:has-text("开启新对话")').first();
+      if (await newChatBtn.count() > 0 && await newChatBtn.isVisible()) {
+        await newChatBtn.click();
+        console.log('[新对话] 已主动开启新对话（重置上下文）');
+        await page.waitForTimeout(3000);
+        return true;
+      }
+      // 兜底：直接导航到主页
+      await page.goto(platform.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(2000);
+      console.log('[新对话] 已通过导航到主页重置对话');
+      return true;
+    } catch (e) {
+      console.log('[新对话] 重置失败:', e.message);
+      return false;
+    }
+  }
 
   // 流式 SSE 解析器：处理增量 chunk，实时提取 RESPONSE（正文）增量；RESPONSE 空时用 THINK 兜底
   function createSSEParser(onResponseDelta, onFinished, onLimitExceeded) {
@@ -547,6 +567,11 @@ async function main() {
     let toolBlockEnd = '';     // 当前工具块的结束标记
     let outputLen = 0;         // 已通过 onDelta 输出的长度（fullContent 的索引）
     let limitExceeded = false; // 是否检测到"对话长度上限"错误
+    // ★ 防死循环：DSML 标签泛滥 & 缓冲停滞检测
+    let dsmlFloodCount = 0;         // 本次等待中收到的 DSML 标签总数
+    let bufferingSince = 0;         // 缓冲开始时间（用于检测停滞）
+    const DSML_FLOOD_LIMIT = 200;   // 超过 200 个标签视为死循环
+    const BUFFER_STALL_MS = 8000;   // 缓冲停滞超过 8 秒视为死循环
 
     // ★ 工具标签的宽容正则：放在 delta 回调之外，避免每次 delta 都重建
     // 兼容任意噪声前缀（DSML、全角/半角竖线、空格等），无论噪声与 "<" 是否跨 chunk
@@ -566,8 +591,7 @@ async function main() {
       while (idx < s.length) {
         if (s.startsWith('DSML', idx)) { idx += 4; continue; }
         if (!/[a-zA-Z0-9_/>]/.test(s[idx])) { idx++; continue; }
-        // ★ 若 s.slice(idx) 恰好是 "DSML" 的某个前缀（D / DS / DSM / S / SM / SML / M / ML / L），
-        //    说明 DSML 字面量还没收完，缓冲等待
+        // ★ 若 s.slice(idx) 恰好是 "DSML" 的某个前缀（D / DS / DSM / S / SM / SML / M / ML / L），说明 DSML 字面量还没收完，缓冲等待
         const remain = s.slice(idx);
         if (remain.length <= 4 && 'DSML'.startsWith(remain)) return true;
         break;
@@ -596,7 +620,6 @@ async function main() {
           const rest = fullContent.slice(i);
 
           // ★ 先吃掉任何残留的闭合标签（无论是否在块内）
-          // 注意：</parameter> 必须放在最前，因为 invoke/calls 块内也可能出现它
           const strayParamClose = rest.match(RE_PARAM_CLOSE);
           if (strayParamClose) {
             i += strayParamClose[0].length;
@@ -643,8 +666,21 @@ async function main() {
               continue;
             }
 
-            // 跨增量缓冲
-            if (isToolTagPrefix(rest)) break;
+            // 跨增量缓冲（含停滞检测）
+            if (isToolTagPrefix(rest)) {
+              if (bufferingSince === 0) {
+                bufferingSince = Date.now();
+              } else if (Date.now() - bufferingSince > BUFFER_STALL_MS) {
+                console.log('[SSE] 标签缓冲停滞超过 ' + BUFFER_STALL_MS + 'ms，放弃缓冲');
+                out += fullContent[i];
+                i++;
+                bufferingSince = 0;
+                continue;
+              }
+              break;
+            } else {
+              bufferingSince = 0;
+            }
 
             out += fullContent[i];
             i++;
@@ -656,8 +692,19 @@ async function main() {
               continue;
             }
             // 闭合标签（calls/invoke/parameter）已在循环开头由 stray*Close 分支统一处理，
-            // 能走到这里说明就是块内的普通内容，直接跳过
-            if (isToolTagPrefix(rest)) break;
+            if (isToolTagPrefix(rest)) {
+              if (bufferingSince === 0) {
+                bufferingSince = Date.now();
+              } else if (Date.now() - bufferingSince > BUFFER_STALL_MS) {
+                console.log('[SSE] 块内标签缓冲停滞超过 ' + BUFFER_STALL_MS + 'ms，放弃缓冲');
+                i++;
+                bufferingSince = 0;
+                continue;
+              }
+              break;
+            } else {
+              bufferingSince = 0;
+            }
             // 块内内容一律跳过
             i++;
           }
@@ -675,6 +722,18 @@ async function main() {
     sseDeltaHandler = (chunk) => {
       sseChunkCount++;
       sseRawBytes += chunk.length;
+
+      // ★ 统计本 chunk 里的 DSML 标签数量，泛滥时强制结束等待
+      const tagMatches = chunk.match(/<\/?[｜|\s]*DSML[｜|\s]*/gi);
+      if (tagMatches) {
+        dsmlFloodCount += tagMatches.length;
+        if (dsmlFloodCount > DSML_FLOOD_LIMIT) {
+          console.log(`[SSE] 检测到 DSML 标签泛滥（${dsmlFloodCount} 个），强制结束本次等待`);
+          try { finishedResolve(); } catch (_) {}
+          return;
+        }
+      }
+
       try { parser(chunk); } catch (e) {}
     };
 
@@ -722,6 +781,10 @@ async function main() {
           toolBlockEnd = '';
           sseChunkCount = 0;
           sseRawBytes = 0;
+          // ★ 补齐：重试时也要清零泛滥计数与缓冲时间戳，
+          //   否则上一次尝试累积的标签数会误触发中止/污染新回复
+          dsmlFloodCount = 0;
+          bufferingSince = 0;
         }
       } catch (e) {}
     }, 3000);
@@ -735,6 +798,14 @@ async function main() {
     });
 
     clearInterval(retryCheckTimer);
+
+    // ★ DSML 泛滥触发中止：开新对话，避免污染历史
+    if (dsmlFloodCount > DSML_FLOOD_LIMIT) {
+      sseDeltaHandler = null;
+      console.log(`[DEBUG][SSE诊断] DSML 泛滥触发中止：chunk数=${sseChunkCount}, 标签数=${dsmlFloodCount}`);
+      await startNewChatIfPossible();
+      return null;
+    }
 
     // 检测到"对话长度上限"错误（SSE 信号 context_length_exceeded），点击"开启新对话"并重新发送
     if (limitExceeded) {
@@ -1061,63 +1132,83 @@ async function main() {
 
       // 无论是否声明了工具，只要回复中包含了工具调用标签，就尝试解析或纠正
       if (parseResult.found) {
-        // 已发现工具调用标签，进行无限纠正直到解析成功
-        while (true) {
-          // ★ 检查取消信号
+        // ★ 有上限的纠正循环（最多 2 次），并带 DSML 泛滥 / 重复输出检测
+        let correctionAttempts = 0;
+        const MAX_CORRECTIONS = 2;
+        let prevOutput = '';
+        let repeatedCount = 0;
+
+        while (correctionAttempts < MAX_CORRECTIONS) {
+          correctionAttempts++;
+
           if (cancelState && cancelState.cancelled) {
-              console.log('[ToolCall] 任务已取消，停止工具纠错');
-              return {
-                  toolCall: null,
-                  toolCalls: [],
-                  rawOutput: rawOutput || '',
-                  assistantContent: null
-              };
+            console.log('[ToolCall] 任务已取消，停止工具纠错');
+            return { toolCall: null, toolCalls: [], rawOutput: rawOutput || '', assistantContent: null };
           }
 
           if (parseResult.success) {
-            // 提取工具调用标签之外的纯文本作为助手文字说明（统一走 stripDsmlTags）
             const textContent = stripDsmlTags(rawOutput)
-              .replace(/\n{3,}/g, '\n\n')                          // 压缩多余空行
+              .replace(/\n{3,}/g, '\n\n')
               .trim();
-
             return {
               toolCall: parseResult.toolCall,
               toolCalls: parseResult.toolCalls,
               rawOutput,
-              assistantContent: cleanTaskCompletedMark(textContent) || null               // 为空则返回 null
+              assistantContent: cleanTaskCompletedMark(textContent) || null
             };
           }
-          console.log('[ToolCall] 格式错误，继续纠正...');
-          let fixExample = ''; // 必须初始化
+
+          // ★ 检测 DSML 标签泛滥
+          const dsmlCount = (rawOutput.match(/<\/?[｜|\s]*DSML/gi) || []).length;
+          if (dsmlCount > 30) {
+            console.log(`[ToolCall] DSML 标签泛滥（${dsmlCount} 个），停止纠正`);
+            break;
+          }
+
+          // ★ 检测连续相同输出
+          if (rawOutput === prevOutput) {
+            repeatedCount++;
+            if (repeatedCount >= 2) {
+              console.log('[ToolCall] 输出连续未变化，停止纠正');
+              break;
+            }
+          } else {
+            repeatedCount = 0;
+          }
+          prevOutput = rawOutput;
+
+          console.log(`[ToolCall] 格式错误，纠正中... (${correctionAttempts}/${MAX_CORRECTIONS})`);
+          let fixExample = '';
           const failedMatch = parseResult.error.match(/失败的参数文本：\s*(.*)/);
           if (failedMatch) {
             const failedText = failedMatch[1].trim();
             fixExample = `\n  【你的错误输出】：${failedText.slice(0, 200)}`;
           } else if (parseResult.error.includes('禁止的标签格式')) {
-            // 当错误是禁止标签时，展示原始输出片段，让模型看到自己错在哪里
             fixExample = `\n  【你的错误输出片段】：${rawOutput.slice(0, 200)}`;
           }
+
           const retryPrompt = `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
             `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
-    `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
-    `✅ 正确格式（唯一允许）：\n` +
-    `<｜｜DSML｜｜ calls>\n` +
-    `<｜｜DSML｜｜ invoke name="工具名">\n` +
-    `<｜｜DSML｜｜ parameter name="参数名1">参数值1</｜｜DSML｜｜ parameter>\n` +
-    `<｜｜DSML｜｜ parameter name="参数名2">参数值2</｜｜DSML｜｜ parameter>\n` +
-    `</｜｜DSML｜｜ invoke>\n` +
-    `</｜｜DSML｜｜ calls>\n`;
+            `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
+            `✅ 正确格式（唯一允许）：\n` +
+            `<｜｜DSML｜｜ calls>\n` +
+            `<｜｜DSML｜｜ invoke name="工具名">\n` +
+            `<｜｜DSML｜｜ parameter name="参数名1">参数值1</｜｜DSML｜｜ parameter>\n` +
+            `<｜｜DSML｜｜ parameter name="参数名2">参数值2</｜｜DSML｜｜ parameter>\n` +
+            `</｜｜DSML｜｜ invoke>\n` +
+            `</｜｜DSML｜｜ calls>\n`;
+
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
           } else {
-            console.log('[ToolCall] 纠正请求未获得有效回复，保留上一轮输出');
+            console.log('[ToolCall] 纠正请求未获得有效回复，放弃纠正');
+            break;
           }
-          console.log('[HTTP] 纠正后输出:', rawOutput);
+          console.log('[HTTP] 纠正后输出:', rawOutput.slice(0, 200));
 
           parseResult = parseToolCall(rawOutput, toolNames);
           if (!parseResult.found) {
-            // 模型拒绝输出工具调用，将当前文本作为最终回复返回
             console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
             const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
             const uiNoise = /^(复制|下载|运行|调试|代码)$/;
@@ -1130,11 +1221,16 @@ async function main() {
               })
               .join('\n')
               .trim();
-
-             const cleaned = cleanTaskCompletedMark(stripDsmlTags(finalText));
+            const cleaned = cleanTaskCompletedMark(stripDsmlTags(finalText));
             return { toolCall: null, toolCalls: [], rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null };
           }
         }
+
+        // ★ 达到最大纠正次数 / 检测到泛滥：降级为普通文本返回，避免死循环
+        console.log('[ToolCall] 纠正失败，降级为普通文本返回');
+        const fallbackText = cleanTaskCompletedMark(stripDsmlTags(rawOutput))
+          || '【系统提示】工具调用格式持续错误，请重试或换一种表达方式。';
+        return { toolCall: null, toolCalls: [], rawOutput: fallbackText, assistantContent: null };
       } else {
         // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
         // 清洗 UI 杂讯，仅在纯文本模式下进行
@@ -1250,33 +1346,19 @@ async function main() {
             const toolsText = tools.length > 0
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
-                        const toolCallInstructions = tools.length > 0
-  ? `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
-    `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
-    `✅ 正确格式（唯一允许）：\n` +
-    `<｜｜DSML｜｜ calls>\n` +
-    `<｜｜DSML｜｜ invoke name="工具名">\n` +
-    `<｜｜DSML｜｜ parameter name="参数名1">参数值1</｜｜DSML｜｜ parameter>\n` +
-    `<｜｜DSML｜｜ parameter name="参数名2">参数值2</｜｜DSML｜｜ parameter>\n` +
-    `</｜｜DSML｜｜ invoke>\n` +
-    `</｜｜DSML｜｜ calls>\n\n` +
-    `示例（调用 read 工具）：\n` +
-    `<｜｜DSML｜｜ calls>\n` +
-    `<｜｜DSML｜｜ invoke name="read">\n` +
-    `<｜｜DSML｜｜ parameter name="filePath">E:\\path\\to\\file.java</｜｜DSML｜｜ parameter>\n` +
-    `<｜｜DSML｜｜ parameter name="offset">120</｜｜DSML｜｜ parameter>\n` +
-    `<｜｜DSML｜｜ parameter name="limit">95</｜｜DSML｜｜ parameter>\n` +
-    `</｜｜DSML｜｜ invoke>\n` +
-    `</｜｜DSML｜｜ calls>\n\n` +
-    `【一次调用多个工具】：<｜｜DSML｜｜ calls> 内可以并列多个 <｜｜DSML｜｜ invoke> 块：\n` +
-    `<｜｜DSML｜｜ calls>\n` +
-    `<｜｜DSML｜｜ invoke name="read">\n<｜｜DSML｜｜ parameter name="filePath">A.java</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n` +
-    `<｜｜DSML｜｜ invoke name="read">\n<｜｜DSML｜｜ parameter name="filePath">B.java</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n` +
-    `</｜｜DSML｜｜ calls>\n\n` +
+            const toolCallInstructions = tools.length > 0
+  ? `\n\n【工具调用格式（必须严格遵守）】\n` +
+    `格式：<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name="工具名"> <｜｜DSML｜｜ parameter name="参数名">值</｜｜DSML｜｜ parameter> </｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>\n` +
+    `示例（只给一个，请勿照抄参数值）：\n` +
+    `<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="read"><｜｜DSML｜｜ parameter name="filePath">/tmp/a.txt</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>\n\n` +
     `【工具使用规则（最高优先级）】：\n` +
     `- 修改文件时，优先使用 edit 工具，绝对不要用 write 整体覆盖。\n` +
-    `- 如果 edit 失败，说明文件内容/结构已经变化，必须先重新 read 读取最新内容，再基于最新内容 edit，而不是改用 write 覆盖。\n` +
-    `❌ 闭合标签必须使用正斜杠：</｜｜DSML｜｜ parameter>，绝对禁止写成 <\｜｜DSML｜｜ parameter> 或其它形式。\n`
+    `- 如果 edit 失败，说明文件内容/结构已经变化，必须先重新 read 读取最新内容，再基于最新内容 edit。\n\n` +
+    `【禁止事项（最高优先级）】：\n` +
+    `- 禁止单独输出 </｜｜DSML｜｜> 或任何孤立闭合标签。\n` +
+    `- 禁止重复输出同一标签。\n` +
+    `- 一次回复只输出一组完整的 <｜｜DSML｜｜ calls> 块。\n` +
+    `- 闭合标签必须使用正斜杠：</｜｜DSML｜｜ parameter>，禁止写成 <\｜｜DSML｜｜ parameter>。\n`
   : '';
             // ===== 流式基础设施：data.stream === true 时，提前设置响应头 + onDelta =====
             let streamCtx = null;
