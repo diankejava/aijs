@@ -1290,7 +1290,7 @@ async function main() {
 
           // ★ 检测 DSML 标签泛滥
           const dsmlCount = (rawOutput.match(/<\/?[｜|\s]*DSML/gi) || []).length;
-          if (dsmlCount > 30) {
+          if (dsmlCount > 100) {
             console.log(`[ToolCall] DSML 标签泛滥（${dsmlCount} 个），停止纠正`);
             break;
           }
