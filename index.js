@@ -892,9 +892,139 @@ async function main() {
       return;
     }
 
+        /**
+     * ★ 标签配对性严格校验：在容错解析之前先做。
+     * 检测"非成双成对/畸形"的工具调用标签，直接报告错误要求模型重写，
+     * 避免容错解析产生"看似成功但参数缺失"的半成品。
+     * @returns {{valid: boolean, errors?: string[]}}
+     */
+    function validateTagPairing(text) {
+      if (!text) return { valid: true };
+
+      // 与 parseToolCall 同样的噪声清洗
+      let cleaned = text
+        .replace(/[​‌‍⁠﻿]/g, '')
+        .replace(/&(?:zwnj|zwj|lrm|rlm);/gi, '')
+        .replace(/<z(?:wnj|wj)/gi, '<');
+      const TAG_NOISE = '(?:DSML|[^a-zA-Z0-9_/>])*';
+      cleaned = cleaned.replace(
+        new RegExp('(<\\/?)' + TAG_NOISE + '(calls|invoke|parameter)(?=[\\s>])', 'gi'),
+        '$1$2'
+      );
+      cleaned = cleaned.replace(/DSML/gi, '');
+
+      // 快速判断：不含工具调用标签则跳过检查
+      if (!/<\/?(?:calls|invoke|parameter)(?=[\s>])/i.test(cleaned)) {
+        return { valid: true };
+      }
+      
+      const errors = [];
+
+      // ★ 抠掉 CDATA 内容，避免其中的 </parameter foo>、<parameter ...> 等字面量被误判为畸形标签。
+      //   用等长空格替换（保持字符串长度与索引对齐，便于日志排查）。
+      //   仅 ① ② 使用这个"干净版"字符串；③ 栈式嵌套检查仍用 cleaned（它自身会跳过 CDATA）。
+      const cleanedNoCDATA = cleaned.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, (m) => ' '.repeat(m.length));
+
+      // ① 闭合标签携带多余内容（粘连畸形：</parameter name="path">、</parameter foo> 等）
+      //    正规闭合标签必须严格是 </parameter> / </invoke> / </calls>
+      const malformedCloseRe = /<\/(calls|invoke|parameter)(\s+[^>]*)?>/gi;
+      let mc;
+      while ((mc = malformedCloseRe.exec(cleanedNoCDATA)) !== null) {
+        const full = mc[0];
+        const inner = mc[2] || '';
+        // 严格判断：标签名后不应有任何字符（包括空白），除紧跟 > 外
+        if (inner.length > 0) {
+          errors.push(`闭合标签携带了多余内容（畸形写法）：${full} —— 闭合标签必须严格写成 </${mc[1]}>，标签名后不得有任何字符`);
+        }
+      }
+
+      // ② 全局开闭数量核对（用 cleanedNoCDATA，排除 CDATA 内的字面量干扰）
+      const countTag = (tag, isClose) =>
+        (cleanedNoCDATA.match(new RegExp('<' + (isClose ? '\\/' : '') + tag + '(?=[\\s>])', 'gi')) || []).length;
+
+      const pairs = [
+        ['calls', countTag('calls', false), countTag('calls', true)],
+        ['invoke', countTag('invoke', false), countTag('invoke', true)],
+        ['parameter', countTag('parameter', false), countTag('parameter', true)],
+      ];
+      for (const [name, open, close] of pairs) {
+        if (open !== close) {
+          errors.push(`<${name}> 开闭标签数量不匹配：开 ${open} 个，闭 ${close} 个`);
+        }
+      }
+
+      // ③ 栈式嵌套顺序检查（跳过 CDATA 内容）
+      //    规则：calls 只能含 invoke；invoke 只能含 parameter；parameter 不嵌套工具标签
+      const allowedChild = {
+        calls: ['invoke'],
+        invoke: ['parameter'],
+        parameter: [],
+      };
+      const stack = [];
+      let i = 0;
+      while (i < cleaned.length) {
+        // 跳过 CDATA
+        if (cleaned.startsWith('<![CDATA[', i)) {
+          const end = cleaned.indexOf(']]>', i);
+          if (end === -1) break;
+          i = end + 3;
+          continue;
+        }
+        const tagMatch = cleaned.slice(i).match(/^<(\/?)(calls|invoke|parameter)(?=[\s>])[^>]*>/i);
+        if (tagMatch) {
+          const isClose = tagMatch[1] === '/';
+          const name = tagMatch[2].toLowerCase();
+          if (!isClose) {
+            if (stack.length > 0) {
+              const parent = stack[stack.length - 1];
+              if (!allowedChild[parent].includes(name)) {
+                errors.push(`标签嵌套顺序错误：<${name}> 不能直接出现在 <${parent}> 内`);
+              }
+            }
+            stack.push(name);
+          } else {
+            if (stack.length === 0) {
+              errors.push(`多余的闭合标签：</${name}>，缺少对应的开标签`);
+            } else {
+              const top = stack.pop();
+              if (top !== name) {
+                errors.push(`闭合标签不匹配：期望 </${top}>，实际是 </${name}>`);
+              }
+            }
+          }
+          i += tagMatch[0].length;
+          continue;
+        }
+        i++;
+      }
+      if (stack.length > 0) {
+        errors.push(`存在未闭合的标签：${stack.map(t => '<' + t + '>').join(', ')}`);
+      }
+
+      if (errors.length > 0) return { valid: false, errors };
+      return { valid: true };
+    }
+
     // 解析模型输出中的工具调用（格式：<invoke name="函数名"><parameter name="参数名">参数值</parameter></invoke>）
     function parseToolCall(text, allowedNames = []) {
       if (!text) return { found: false, success: false, toolCalls: [], toolCall: null };
+
+      // ★ 严格配对检查：一旦发现非成双成对/畸形，直接报错要求模型重写，
+      //   绝不做容错解析，避免产出"看似成功但参数残缺"的半成品
+      //   （例如 </parameter name="path"> 会吃掉 path 的开标签，导致后续参数全部丢失）
+      const pairing = validateTagPairing(text);
+      if (!pairing.valid) {
+        return {
+          found: true,
+          success: false,
+          toolCalls: [],
+          toolCall: null,
+          error:
+            '工具调用标签不是严格成双成对的，具体错误如下：\n' +
+            pairing.errors.map(e => '  - ' + e).join('\n') +
+            '\n请重新输出完整的工具调用：每个开标签必须有对应的闭合标签，闭合标签不得携带属性，且必须严格成对出现、不得与其他标签粘连。'
+        };
+      }
 
       // 清理零宽字符、HTML 实体、<zwnj 字面量
       text = text
@@ -1134,7 +1264,7 @@ async function main() {
       if (parseResult.found) {
         // ★ 有上限的纠正循环（最多 2 次），并带 DSML 泛滥 / 重复输出检测
         let correctionAttempts = 0;
-        const MAX_CORRECTIONS = 2;
+        const MAX_CORRECTIONS = 30;
         let prevOutput = '';
         let repeatedCount = 0;
 
@@ -1176,27 +1306,13 @@ async function main() {
             repeatedCount = 0;
           }
           prevOutput = rawOutput;
-
           console.log(`[ToolCall] 格式错误，纠正中... (${correctionAttempts}/${MAX_CORRECTIONS})`);
-          let fixExample = '';
-          const failedMatch = parseResult.error.match(/失败的参数文本：\s*(.*)/);
-          if (failedMatch) {
-            const failedText = failedMatch[1].trim();
-            fixExample = `\n  【你的错误输出】：${failedText.slice(0, 200)}`;
-          } else if (parseResult.error.includes('禁止的标签格式')) {
-            fixExample = `\n  【你的错误输出片段】：${rawOutput.slice(0, 200)}`;
-          }
 
-          const retryPrompt = `上一轮你的工具调用格式错误：${parseResult.error}${fixExample}\n` +
-            `\n\n【!!!最高优先级指令：工具调用格式!!!】\n` +
-            `你现在必须使用以下 XML 格式调用工具，绝对禁止使用任何其他格式。\n\n` +
-            `✅ 正确格式（唯一允许）：\n` +
-            `<｜｜DSML｜｜ calls>\n` +
-            `<｜｜DSML｜｜ invoke name="工具名">\n` +
-            `<｜｜DSML｜｜ parameter name="参数名1">参数值1</｜｜DSML｜｜ parameter>\n` +
-            `<｜｜DSML｜｜ parameter name="参数名2">参数值2</｜｜DSML｜｜ parameter>\n` +
-            `</｜｜DSML｜｜ invoke>\n` +
-            `</｜｜DSML｜｜ calls>\n`;
+          // ★ 极简版：只发错误位置，不发任何示例/规则
+          const retryPrompt =
+            `【工具调用格式错误】\n` +
+            `错误详情：\n${parseResult.error}\n\n` +
+            `请重新输出完整的工具调用。`;
 
           reply = await sendAndWait(retryPrompt, cancelState);
           if (reply && reply.trim()) {
@@ -1358,7 +1474,13 @@ async function main() {
     `- 禁止单独输出 </｜｜DSML｜｜> 或任何孤立闭合标签。\n` +
     `- 禁止重复输出同一标签。\n` +
     `- 一次回复只输出一组完整的 <｜｜DSML｜｜ calls> 块。\n` +
-    `- 闭合标签必须使用正斜杠：</｜｜DSML｜｜ parameter>，禁止写成 <\｜｜DSML｜｜ parameter>。\n`
+    `- 闭合标签必须使用正斜杠：</｜｜DSML｜｜ parameter>，禁止写成 <\｜｜DSML｜｜ parameter>。\n` +
+    `- ❌ 禁止把闭合标签和下一个开标签合并输出，例如禁止写成：\n` +
+    `    </｜｜DSML｜｜ parameter name="path">E:\\...\n` +
+    `  ✅ 必须严格写成两个独立标签：\n` +
+    `    </｜｜DSML｜｜ parameter>\n` +
+    `    <｜｜DSML｜｜ parameter name="path">E:\\...\n` +
+    `  （每个参数的开标签、值、闭合标签必须各自成对，不得跨参数合并）\n`
   : '';
             // ===== 流式基础设施：data.stream === true 时，提前设置响应头 + onDelta =====
             let streamCtx = null;
