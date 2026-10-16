@@ -1001,12 +1001,121 @@ async function main() {
         errors.push(`存在未闭合的标签：${stack.map(t => '<' + t + '>').join(', ')}`);
       }
 
+      // ④ 严格格式校验：所有"含工具标签关键字"的 <...> 片段必须严格符合以下形式之一：
+      //      <calls>            <calls 任意属性>
+      //      <invoke ...>       <parameter ...>
+      //      </calls>           </invoke>           </parameter>
+      //    任何其他形式（含属性乱序、闭标签带属性、跨标签粘连、多出字符等）
+      //    一律报错，不做猜测性修复，让模型重新生成。
+      //    只检查"含 calls/invoke/parameter 关键字"的片段，避免误伤正文里的 <div> / <T> / <https://...>。
+      const strictTagRe = /^(?:<(?:calls|invoke|parameter)(?:\s[^>]*)?>|<\/(?:calls|invoke|parameter)>)$/;
+      let ltPos = -1;
+      const bogusTags = [];
+      while ((ltPos = cleanedNoCDATA.indexOf('<', ltPos + 1)) !== -1) {
+        const rest = cleanedNoCDATA.slice(ltPos);
+        // 跳过注释/CDATA（双保险）
+        if (rest.startsWith('<!--') || rest.startsWith('<![CDATA[')) continue;
+
+        const gt = rest.indexOf('>');
+        // ★ 提取完整"标签样"片段：从 < 到第一个 >，不管中间有多少个 <
+        //   这样才能捕获 </... </parameter> 这种"多余的 < 后紧跟关键字"的畸形。
+        //   如果直接截到下一个 <，前半段 </... 会因不含关键字被跳过，漏检。
+        let frag;
+        if (gt === -1) {
+          // 到结尾都没有 > → 也算异常片段（截前 200 字符用于展示）
+          frag = rest.slice(0, Math.min(rest.length, 200)).trim();
+        } else {
+          frag = rest.slice(0, gt + 1);
+        }
+        // 不含工具关键字 → 视为正文里的普通 <，跳过
+        // ★ 跳噪声的方式必须与清洗正则一致（`(?:DSML|[^a-zA-Z0-9_>])*`）：
+        //    否则 `</｜｜DSML｜｜ </parameter>` 会被 `[^a-zA-Z]*` 卡在 DSML 的 D 上，
+        //    导致 afterNoise 变成 `DSML｜｜ </parameter>` 而不以 parameter 开头 → 漏检。
+        const afterNoise = frag.replace(/^<\/?(?:DSML|[^a-zA-Z0-9_>])*/i, '');
+        if (!/^(?:calls|invoke|parameter)\b/i.test(afterNoise)) continue;
+        // 含工具关键字 → 必须严格合法，否则收集报错
+        if (!strictTagRe.test(frag)) {
+          bogusTags.push(frag.slice(0, 120));
+        }
+      }
+      if (bogusTags.length > 0) {
+        const sample = bogusTags.slice(0, 3).join(' / ');
+        errors.push(
+          `发现不符合规范的标签片段：${sample}\n` +
+          `  工具标签只允许以下严格形式：\n` +
+          `    <calls>  <invoke name="函数名">  <parameter name="参数名">值</parameter>  </invoke>  </calls>\n` +
+          `  禁止以下写法：\n` +
+          `    - 闭合标签携带属性（如 </parameter name="x">）\n` +
+          `    - 属性写在标签名前（如 <... filePath="x" ... parameter>）\n` +
+          `    - 标签名前插入任何非 < 或 </ 开头的字符\n` +
+          `    - 闭合标签和下一个开标签粘连\n` +
+          `    - 标签名后跟除空格或 > 之外的字符\n` +
+          `  请重新输出完整的工具调用，每个标签必须独立、严格、干净。`
+        );
+      }
+
       if (errors.length > 0) return { valid: false, errors };
       return { valid: true };
     }
 
+    /**
+     * ★ 参数语义校验：根据工具声明的 JSON Schema，检查参数是否齐全、类型正确、值合法。
+     * 只覆盖最常见的几类错误：required / type / enum / additionalProperties。
+     * @returns {{valid: boolean, error?: string}}
+     */
+    function validateArgsAgainstSchema(fnName, args, schema) {
+      if (!schema || typeof schema !== 'object') return { valid: true };
+
+      const errors = [];
+
+      // ① required 检查
+      const required = Array.isArray(schema.required) ? schema.required : [];
+      const missing = required.filter(k => !(k in args));
+      if (missing.length > 0) {
+        errors.push(`缺少必需参数：${missing.join(', ')}`);
+      }
+
+      // ② type / enum / 额外属性检查
+      const props = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+      const propKeys = Object.keys(props);
+
+      for (const [k, v] of Object.entries(args)) {
+        const prop = props[k];
+        if (!prop) {
+          // additionalProperties !== false 时允许未知参数，这里静默放行
+          if (schema.additionalProperties === false) {
+            errors.push(`不允许多余参数 "${k}"（允许的参数：${propKeys.join(', ')}）`);
+          }
+          continue;
+        }
+
+        // 类型检查
+        const expected = prop.type;
+        if (expected) {
+          const actual = Array.isArray(v) ? 'array' : (v === null ? 'null' : typeof v);
+          const ok =
+            expected === actual ||
+            (expected === 'integer' && actual === 'number' && Number.isInteger(v)) ||
+            (expected === 'number' && actual === 'number');
+          if (!ok) {
+            errors.push(`参数 "${k}" 类型错误：期望 ${expected}，实际 ${actual}（值：${JSON.stringify(v).slice(0, 60)}）`);
+          }
+        }
+
+        // enum 检查
+        if (Array.isArray(prop.enum) && !prop.enum.includes(v)) {
+          errors.push(`参数 "${k}" 值不在允许列表：期望 ${JSON.stringify(prop.enum)}，实际 ${JSON.stringify(v)}`);
+        }
+      }
+
+      if (errors.length > 0) {
+        return { valid: false, error: errors.join('；') };
+      }
+      return { valid: true };
+    }
+
     // 解析模型输出中的工具调用（格式：<invoke name="函数名"><parameter name="参数名">参数值</parameter></invoke>）
-    function parseToolCall(text, allowedNames = []) {
+    function parseToolCall(text, allowedNames = [], toolSchemas = null) {
       if (!text) return { found: false, success: false, toolCalls: [], toolCall: null };
 
       // ★ 严格配对检查：一旦发现非成双成对/畸形，直接报错要求模型重写，
@@ -1160,7 +1269,17 @@ async function main() {
           if (hasInvalidKey) {
             console.log('[ToolCall] 部分参数被忽略，已提取的有效参数:', JSON.stringify(validArgs));
           }
-          results.push({ success: true, toolCall: { name: rawName, arguments: validArgs } });
+          // ★ 参数语义校验（schema）
+          const schema = toolSchemas && toolSchemas[rawName];
+          const schemaCheck = validateArgsAgainstSchema(rawName, validArgs, schema);
+          if (!schemaCheck.valid) {
+            results.push({
+              success: false,
+              error: `函数 "${rawName}" 参数不符合 schema：${schemaCheck.error}`
+            });
+          } else {
+            results.push({ success: true, toolCall: { name: rawName, arguments: validArgs } });
+          }
         }
       }
 
@@ -1252,13 +1371,22 @@ async function main() {
         .trim();
     }
 
-    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, cancelState, onDelta = null) {
+    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, toolSchemas, cancelState, onDelta = null) {
+      // ★ 追踪 onDelta 是否已经发出过任何内容
+      //   如果从未发出过，最终由调用方（task()）把 rawOutput 一次性补发出去，
+      //   避免客户端收到"只有 finish 没有 content"的空响应。
+      let emittedContent = false;
+      const trackOnDelta = onDelta ? (chunk) => {
+        if (chunk && chunk.length > 0) emittedContent = true;
+        try { onDelta(chunk); } catch (e) {}
+      } : null;
+
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
-      let reply = await sendAndWait(prompt, cancelState, onDelta);
+      let reply = await sendAndWait(prompt, cancelState, trackOnDelta);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
 
-      let parseResult = parseToolCall(rawOutput, toolNames);
+      let parseResult = parseToolCall(rawOutput, toolNames, toolSchemas);
 
       // 无论是否声明了工具，只要回复中包含了工具调用标签，就尝试解析或纠正
       if (parseResult.found) {
@@ -1273,7 +1401,7 @@ async function main() {
 
           if (cancelState && cancelState.cancelled) {
             console.log('[ToolCall] 任务已取消，停止工具纠错');
-            return { toolCall: null, toolCalls: [], rawOutput: rawOutput || '', assistantContent: null };
+            return { toolCall: null, toolCalls: [], rawOutput: rawOutput || '', assistantContent: null,emittedContent };
           }
 
           if (parseResult.success) {
@@ -1284,7 +1412,8 @@ async function main() {
               toolCall: parseResult.toolCall,
               toolCalls: parseResult.toolCalls,
               rawOutput,
-              assistantContent: cleanTaskCompletedMark(textContent) || null
+              assistantContent: cleanTaskCompletedMark(textContent) || null,
+              emittedContent   // ★ 加这一行
             };
           }
 
@@ -1314,7 +1443,7 @@ async function main() {
             `错误详情：\n${parseResult.error}\n\n` +
             `请重新输出完整的工具调用。`;
 
-          reply = await sendAndWait(retryPrompt, cancelState);
+          reply = await sendAndWait(retryPrompt, cancelState, trackOnDelta);
           if (reply && reply.trim()) {
             rawOutput = reply.trim();
           } else {
@@ -1323,7 +1452,7 @@ async function main() {
           }
           console.log('[HTTP] 纠正后输出:', rawOutput.slice(0, 200));
 
-          parseResult = parseToolCall(rawOutput, toolNames);
+          parseResult = parseToolCall(rawOutput, toolNames, toolSchemas);
           if (!parseResult.found) {
             console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
             const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
@@ -1338,7 +1467,7 @@ async function main() {
               .join('\n')
               .trim();
             const cleaned = cleanTaskCompletedMark(stripDsmlTags(finalText));
-            return { toolCall: null, toolCalls: [], rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null };
+            return { toolCall: null, toolCalls: [], rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null,emittedContent };
           }
         }
 
@@ -1346,7 +1475,7 @@ async function main() {
         console.log('[ToolCall] 纠正失败，降级为普通文本返回');
         const fallbackText = cleanTaskCompletedMark(stripDsmlTags(rawOutput))
           || '【系统提示】工具调用格式持续错误，请重试或换一种表达方式。';
-        return { toolCall: null, toolCalls: [], rawOutput: fallbackText, assistantContent: null };
+        return { toolCall: null, toolCalls: [], rawOutput: fallbackText, assistantContent: null,emittedContent };
       } else {
         // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
         // 清洗 UI 杂讯，仅在纯文本模式下进行
@@ -1361,7 +1490,7 @@ async function main() {
           })
           .join('\n');
         const cleaned = cleanTaskCompletedMark(stripDsmlTags(cleanText));
-        return { toolCall: null, rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null };
+        return { toolCall: null, rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null,emittedContent };
       }
     }
 
@@ -1411,6 +1540,13 @@ async function main() {
             let userMsg = userMsgs.length ? extractTextContent(userMsgs[userMsgs.length - 1].content) : '';
             const tools = data.tools || [];
             const toolNames = tools.map(t => t.function.name);
+            // ★ 构建 name → schema 的映射，用于参数语义校验
+            const toolSchemas = {};
+            for (const t of tools) {
+              if (t && t.function && t.function.name) {
+                toolSchemas[t.function.name] = t.function.parameters || null;
+              }
+            }
 
             console.log('[HTTP] 可用工具:', toolNames.join(', '));
             if (!userMsg) {
@@ -1563,8 +1699,8 @@ async function main() {
               return;
             }
 
-            const { toolCall, toolCalls, rawOutput, assistantContent } = await getFinalReplyWithTools(
-              promptText, toolsText, toolCallInstructions, toolNames, cancelState,
+            const { toolCall, toolCalls, rawOutput, assistantContent, emittedContent } = await getFinalReplyWithTools(
+              promptText, toolsText, toolCallInstructions, toolNames, toolSchemas, cancelState,
               streamCtx ? streamCtx.onDelta : null
             );
 
@@ -1673,7 +1809,15 @@ async function main() {
                   res.end();
                 }
               } else {
-                // 无工具调用（纯文本），正文已通过 onDelta 流式输出，只发 finish + DONE
+                // ★ 无工具调用（纯文本）：
+                //   如果 onDelta 从未发出过内容（比如走了纠正循环、降级返回），
+                //   这里把 rawOutput 一次性补发，避免客户端收到空响应。
+                if (alive() && !emittedContent && rawOutput) {
+                  res.write(`data: ${JSON.stringify({
+                    id: chunkId, object: 'chat.completion.chunk', created, model,
+                    choices: [{ index: 0, delta: { content: rawOutput }, finish_reason: null }]
+                  })}\n\n`);
+                }
                 if (alive()) {
                   res.write(`data: ${JSON.stringify({
                     id: chunkId, object: 'chat.completion.chunk', created, model,
