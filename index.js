@@ -235,6 +235,13 @@ async function main() {
   browser = initResult.browser;
   page = initResult.page;
 
+  // ★ 程序启动后第一次请求标志：
+  //   - 程序刚启动时 DeepSeek 停在新对话界面，服务端上下文为空
+  //   - 此时如果客户端发完整历史，必须用 fullPromptText（完整历史）建立上下文
+  //   - 之后依赖服务端上下文，用 promptText（system + 最新 user）
+  //   - 超限切换新对话后，由 limitExceeded 分支用 fullText 重发（已有逻辑）
+  let isFirstRequestAfterStart = true;
+
   async function findEditor() {
     const selectors = platform.editor.split(',').map(s => s.trim());
     for (const sel of selectors) {
@@ -305,7 +312,20 @@ async function main() {
         if (await newChatBtn.count() > 0 && await newChatBtn.isVisible()) {
           await newChatBtn.click();
           console.log('[新对话] 已点击"开启新对话"，等待新对话加载...');
-          await page.waitForTimeout(3000);
+          // ★ 增强等待：等页面加载 + 输入框真正可见
+          try {
+            await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          } catch (_) {}
+          await page.waitForTimeout(2000);
+          // ★ 确认输入框就绪（最多再等 10 秒）
+          const editorSelector = platform.editor.split(',').map(s => s.trim())[0];
+          try {
+            await page.waitForSelector(editorSelector, { state: 'visible', timeout: 10000 });
+            console.log('[新对话] 输入框已就绪');
+          } catch (_) {
+            console.log('[新对话] 等待输入框可见超时，仍尝试继续');
+          }
+          await page.waitForTimeout(1000);
           return true;
         } else {
           console.log('[新对话] 未找到"开启新对话"按钮');
@@ -426,7 +446,7 @@ async function main() {
     };
   }
 
-  async function sendAndWait(text, cancelState = null, onDelta = null, retryCount = 0) {
+  async function sendAndWait(text, cancelState = null, onDelta = null, retryCount = 0, fullText = null) {
     console.log('\x1b[36m[DEBUG] === 发送消息 ===\x1b[0m');
     console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', text.slice(0, 100));
 
@@ -738,6 +758,7 @@ async function main() {
     };
 
     // 点击发送按钮
+    const seqBefore = sseRequestSeq;  // ★ 记录点击前的 completion 请求序号
     const sendBtn = await findSendButton();
     if (sendBtn) {
       console.log('\x1b[36m[DEBUG] 点击发送按钮\x1b[0m');
@@ -745,6 +766,40 @@ async function main() {
     } else {
       console.log('\x1b[36m[DEBUG] Enter 发送\x1b[0m');
       await editor.press('Enter');
+    }
+
+    // ★ 仅在重发时（retryCount > 0）验证发送是否真正触发了 SSE，避免正常请求增加延迟
+    if (retryCount > 0) {
+      // 新会话后页面加载慢，3 秒可能不够；延长到 5 秒避免误判导致重复发送
+      await page.waitForTimeout(5000);
+      if (sseRequestSeq === seqBefore) {
+        console.log('[DEBUG] 重发后 3 秒内未触发 completion 请求，消息可能未发送成功，尝试再次发送');
+        try {
+          const editorAfter = await findEditor();
+          if (editorAfter) {
+            const hasContent = await editorAfter.evaluate(el => {
+              const text = el.textContent || el.value || '';
+              return text.trim().length > 0;
+            });
+            if (hasContent) {
+              // 输入框还有内容 → 发送按钮没点对，再试一次
+              const btn2 = await findSendButton();
+              if (btn2) {
+                await btn2.click();
+                console.log('[DEBUG] 已再次点击发送按钮');
+              } else {
+                await editorAfter.press('Enter');
+                console.log('[DEBUG] 已再次按 Enter 发送');
+              }
+            } else {
+              // 输入框已空 → 消息发出去了但没触发 SSE，可能是页面跳转导致拦截失效
+              console.log('[DEBUG] 输入框已空但未触发 SSE，可能页面跳转导致拦截失效');
+            }
+          }
+        } catch (e) {
+          console.log('[DEBUG] 发送检测异常:', e.message);
+        }
+      }
     }
 
     // 检测超限提示（限制在通知/错误区域）
@@ -811,11 +866,20 @@ async function main() {
     if (limitExceeded) {
       sseDeltaHandler = null;
       console.log('[新对话] SSE 检测到对话长度上限，点击"开启新对话"...');
-      await detectAndHandleLimit();
-      if (retryCount < 1) {
-        console.log('[新对话] 已开新对话，重新发送消息...');
-        return sendAndWait(text, cancelState, onDelta, retryCount + 1);
+      const handled = await detectAndHandleLimit();
+      if (!handled) {
+        console.log('[新对话] detectAndHandleLimit 未成功，回退到 startNewChatIfPossible');
+        await startNewChatIfPossible();
       }
+      if (retryCount < 1) {
+        // ★ 新会话重发：用完整历史（fullText），客户端已压缩过历史，不会超限。
+        //   旧会话里 prompt 本身就很短（只发 system + 当前 user），新会话里用完整历史
+        //   让模型看到之前的对话上下文，能正常复现任务。
+        const retryText = fullText || text;
+        console.log(`[新对话] 已开新对话，重新发送消息...（prompt ${retryText.length} 字符，${fullText ? '完整历史' : '原 prompt'}）`);
+        return sendAndWait(retryText, cancelState, onDelta, retryCount + 1, fullText);
+      }
+      console.log('[新对话] 重试次数已用尽，返回 null');
       return null;
     }
 
@@ -869,7 +933,8 @@ async function main() {
         } else {
           console.log('[DEBUG] 未检测到重试按钮，重新发送消息重试...');
           await page.waitForTimeout(1000);
-          return sendAndWait(text, cancelState, onDelta, retryCount + 1);
+          // ★ 传递 fullText，避免超时重试后再超限时丢失新会话版本
+          return sendAndWait(text, cancelState, onDelta, retryCount + 1, fullText);
         }
       }
       return null;
@@ -966,7 +1031,17 @@ async function main() {
         // 跳过 CDATA
         if (cleaned.startsWith('<![CDATA[', i)) {
           const end = cleaned.indexOf(']]>', i);
-          if (end === -1) break;
+          if (end === -1) {
+            // ★ CDATA 未闭合：直接报告具体原因，让模型补上 ]]> 重写。
+            //   不 break：继续扫描后面的闭合标签（</parameter>/</invoke>/</calls>），
+            //   避免因提前退出导致 stack 残留，误报"存在未闭合的标签"（掩盖真实原因）。
+            errors.push(
+              `参数值中的 <![CDATA[ 未闭合：缺少对应的 ]]> 结束标记。` +
+              `CDATA 必须以 <![CDATA[ 开头、以 ]]> 结尾，请检查参数值并在末尾补上 ]]>。`
+            );
+            i += 9; // '<![CDATA['.length === 9
+            continue;
+          }
           i = end + 3;
           continue;
         }
@@ -1170,18 +1245,33 @@ async function main() {
           results.push({ success: false, error: 'name 属性不能为空' });
           continue;
         }
+        // ★ 客户端未声明任何工具时，模型不应输出工具调用
+        if (allowedNames.length === 0) {
+          results.push({ success: false, error: '客户端未声明任何可用工具，禁止输出工具调用，请直接以纯文本回复' });
+          continue;
+        }
         if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(rawName)) {
           results.push({ success: false, error: `无效的函数名格式 "${rawName}"，函数名只能包含字母、数字和下划线` });
           continue;
         }
-        if (allowedNames.length > 0 && !allowedNames.includes(rawName)) {
+        if (!allowedNames.includes(rawName)) {
           results.push({ success: false, error: `无效的函数名 "${rawName}"，允许的函数名：${allowedNames.join(', ')}` });
           continue;
         }
 
         // 无参数的工具调用
         if (rawBody.trim() === '') {
-          results.push({ success: true, toolCall: { name: rawName, arguments: {} } });
+          // ★ 即使无参数，也要过 schema 校验（可能 required 不为空）
+          const schema = toolSchemas && toolSchemas[rawName];
+          const schemaCheck = validateArgsAgainstSchema(rawName, {}, schema);
+          if (!schemaCheck.valid) {
+            results.push({
+              success: false,
+              error: `函数 "${rawName}" 参数不符合 schema：${schemaCheck.error}`
+            });
+          } else {
+            results.push({ success: true, toolCall: { name: rawName, arguments: {} } });
+          }
           continue;
         }
 
@@ -1371,7 +1461,7 @@ async function main() {
         .trim();
     }
 
-    async function getFinalReplyWithTools(promptText, toolsText, instruction, toolNames, toolSchemas, cancelState, onDelta = null) {
+    async function getFinalReplyWithTools(promptText, fullPromptText, toolsText, instruction, toolNames, toolSchemas, cancelState, onDelta = null) {
       // ★ 追踪 onDelta 是否已经发出过任何内容
       //   如果从未发出过，最终由调用方（task()）把 rawOutput 一次性补发出去，
       //   避免客户端收到"只有 finish 没有 content"的空响应。
@@ -1382,7 +1472,9 @@ async function main() {
       } : null;
 
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
-      let reply = await sendAndWait(prompt, cancelState, trackOnDelta);
+      // ★ 新会话完整版本（limitExceeded 重发时用）
+      let fullPrompt = `【可用工具】\n${toolsText}${instruction}\n\n${fullPromptText}`;
+      let reply = await sendAndWait(prompt, cancelState, trackOnDelta, 0, fullPrompt);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
 
@@ -1555,43 +1647,123 @@ async function main() {
               return;
             }
 
-            // 防重放过滤器（保留）
-            // if (userMsg.includes('User:') || userMsg.includes('Assistant:')) {
-            //   console.log('\x1b[31m[网关拦截] 检测到回流的对话历史，已拒绝:\x1b[0m', userMsg.slice(0, 80));
-            //   res.writeHead(200, { 'Content-Type': 'application/json' });
-            //   res.end(JSON.stringify({
-            //     choices: [{
-            //       message: { role: 'assistant', content: '请求已被拦截，请勿发送包含对话历史的脏数据。' },
-            //       finish_reason: 'stop'
-            //     }]
-            //   }));
-            //   return;
-            // }
-
             const MAX_HISTORY = 20;
             const recentMessages = messages.slice(-MAX_HISTORY);
             const historyNoise = /^(复制|下载|运行|调试|代码)$/;
-            let promptText = "";
-            for (const msg of recentMessages) {
-              let rawContent = extractTextContent(msg.content);
-              // 只清洗 assistant 消息中的 UI 杂讯（行级过滤，避免误删正文中的"代码""运行"等词）
-              if (msg.role === 'assistant') {
-                rawContent = rawContent
-                  .split('\n')
-                  .filter(line => !historyNoise.test(line.trim()))
-                  .join('\n');
+
+            // ★ 构建两个版本的 prompt：
+            //   - promptText（默认，旧会话用）：只发 system + 当前 user，不发任何历史。
+            //     依赖 DeepSeek 会话自身的服务端上下文，避免"prompt 历史 + 服务端上下文"双重累积导致超限。
+            //   - fullPromptText（新会话用）：完整历史，切换新对话后重发时使用。
+            //     客户端会自己压缩历史，新会话本身没超限过，所以直接用客户端给的完整 messages。
+                        function buildPromptText(includeFullHistory) {
+              let text = "";
+
+              if (!includeFullHistory) {
+                // ★ 旧会话：system + 最后一条 user + 最后一次工具调用的结果
+                //
+                //   核心原理：
+                //   - 第 1 轮发 system + user → 服务端上下文累积这两条
+                //   - 第 2 轮发 system + user + tool1 结果 → tool1 结果进服务端上下文
+                //   - 第 3 轮发 system + user + tool2 结果 → tool2 结果进服务端上下文
+                //   - 因此每轮只需发"最新一条 tool 结果"，历史 tool 结果已在服务端上下文里
+                //   - 好处：大文件 tool 结果不用截断（prompt 里只有 1 批），不双重累积，不超限
+                //
+                //   实现细节：
+                //   - system 每次发（防止服务端裁剪丢失）
+                //   - user 只发最后一条（历史 user 在服务端上下文里）
+                //   - tool 消息发"最后一条 assistant 之后的所有 tool"——
+                //     单工具调用 = 最后一条；并行多工具调用 = 全部（都对应同一个 tool_calls）
+                //   - 纯聊天（无 tool 消息）：只发 system + 最后 user，行为不变
+
+                for (const msg of messages) {
+                  if (msg.role === 'system') {
+                    const rawContent = extractTextContent(msg.content);
+                    text += `【系统提示】\n${rawContent.slice(0, 2000)}`;
+                  }
+                }
+
+                if (userMsg) {
+                  text += `【用户消息】\n${userMsg.slice(0, 2000)}`;
+                }
+
+                // ★ 找到最后一条 user 的索引
+                let lastUserIdx = -1;
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (messages[i].role === 'user') {
+                    lastUserIdx = i;
+                    break;
+                  }
+                }
+
+                // ★ 只发「最后一批连续 tool 消息」：
+                //   - agent 多轮循环里，每轮都会新增一批 tool 消息
+                //   - 之前的批次已经在上一次请求发过、进入了服务端上下文
+                //   - 这一次只发最新一批（最后一段连续的 tool 消息）
+                //   如果从 lastUserIdx 之后发「所有 tool」，会重复发送历史 tool 结果
+                //   并行多工具调用（一次 assistant 后跟 3 条 tool）会被当作一批全部发送
+                let toolGroupStart = -1;
+                let toolGroupEnd = -1;
+                for (let i = messages.length - 1; i > lastUserIdx; i--) {
+                  if (messages[i].role === 'tool') {
+                    if (toolGroupEnd === -1) toolGroupEnd = i;
+                    toolGroupStart = i;
+                  } else if (toolGroupEnd !== -1) {
+                    // 遇到非 tool 消息，说明这一批 tool 结束
+                    break;
+                  }
+                }
+
+                if (toolGroupStart !== -1 && toolGroupEnd !== -1) {
+                  for (let i = toolGroupStart; i <= toolGroupEnd; i++) {
+                    const content = extractTextContent(messages[i].content);
+                    // ★ 不截断：只有最新一批 tool 结果，完整发送让模型能看到大文件全文
+                    text += `【工具信息】\n${content}`;
+                  }
+                }
+
+                return text;
               }
-              const content = rawContent.slice(0, 2000);
-              if (msg.role === 'system') {
-                promptText += `【系统提示】\n${content}`;
-              } else if (msg.role === 'user') {
-                promptText += `【用户消息】\n${content}`;
-              } else if (msg.role === 'assistant') {
-                promptText += `【模型回复】\n${content}`;
-              } else if (msg.role === 'tool') {
-                promptText += `【工具信息】\n${content}`;
+
+              // ★ 新会话：完整历史（客户端已压缩，直接用完整 messages 让模型完全复现上下文）
+              for (const msg of messages) {
+                let rawContent = extractTextContent(msg.content);
+                if (msg.role === 'assistant') {
+                  rawContent = rawContent
+                    .split('\n')
+                    .filter(line => !historyNoise.test(line.trim()))
+                    .join('\n');
+                }
+                if (msg.role === 'system') {
+                  text += `【系统提示】\n${rawContent}`;
+                } else if (msg.role === 'user') {
+                  text += `【用户消息】\n${rawContent}`;
+                } else if (msg.role === 'assistant') {
+                  text += `【模型回复】\n${rawContent}`;
+                } else if (msg.role === 'tool') {
+                  text += `【工具信息】\n${rawContent}`;
+                }
+              }
+              return text;
+            }
+
+            const promptText = buildPromptText(false);   // 旧会话用：极简
+            const fullPromptText = buildPromptText(true); // 新会话用：完整历史
+
+            // ★ 程序启动后第一次请求：服务端上下文为空，必须用完整历史建立上下文
+            //   之后依赖服务端上下文，用 promptText（system + 最新 user）
+            let actualPromptText = promptText;
+            let actualFullPromptText = fullPromptText;
+            if (isFirstRequestAfterStart) {
+              isFirstRequestAfterStart = false;
+              // 只有 messages 里有实质历史（> system + 1 user）时才需要切换
+              // 新任务场景（只有 system + 1 user）两者等价，无需特别处理
+              if (messages.length > 2) {
+                console.log('[启动] 首次请求检测到历史消息，使用完整历史 prompt 建立上下文');
+                actualPromptText = fullPromptText;
               }
             }
+            console.log(`[HTTP] prompt 模式：${actualPromptText === fullPromptText ? '完整历史' : '旧会话极简'} ${actualPromptText.length} 字符 / 完整版 ${fullPromptText.length} 字符`);
 
             console.log('[HTTP] 收到消息:', userMsg.slice(0, 50), '...');
 
@@ -1684,8 +1856,9 @@ async function main() {
 
             // 真正流式：无工具 + 流式请求时，正文边接收边返回
             if (data.stream === true && tools.length === 0) {
-              const streamPrompt = `【可用工具】\n无\n\n${promptText}`;
-              await sendAndWait(streamPrompt, cancelState, streamCtx.onDelta);
+              const streamPrompt = `【可用工具】\n无\n\n${actualPromptText}`;
+              const streamFullPrompt = `【可用工具】\n无\n\n${fullPromptText}`;
+              await sendAndWait(streamPrompt, cancelState, streamCtx.onDelta, 0, streamFullPrompt);
               // ★ 把流式缓冲区里最后的内容吐出来（尾部半截 '<...' 会被强制丢弃）
               try { streamCtx.flushStream(true); } catch (_) {}
               if (!streamCtx.isEnded() && res.writable) {
@@ -1700,7 +1873,7 @@ async function main() {
             }
 
             const { toolCall, toolCalls, rawOutput, assistantContent, emittedContent } = await getFinalReplyWithTools(
-              promptText, toolsText, toolCallInstructions, toolNames, toolSchemas, cancelState,
+              actualPromptText, fullPromptText, toolsText, toolCallInstructions, toolNames, toolSchemas, cancelState,
               streamCtx ? streamCtx.onDelta : null
             );
 
