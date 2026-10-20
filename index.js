@@ -261,15 +261,34 @@ async function main() {
   }
 
   // 检测重试按钮（中英文 + CSS 类名 + text/aria/title）
+  // ★ 只接受"视口下半部分"的按钮，避免误触历史消息的"重新生成"按钮
+  //   - 新消息出现在页面底部，其重试按钮也在底部
+  //   - 历史消息的重试按钮在视口上方或上半部分，不在检查范围内
   async function detectRetryButton() {
     const retryPatterns = ['重试', '重新生成', '重新发送', 'Retry', 'Refresh', 'refresh', 'retry', '超时', 'timeout', 'Timeout', '重新加载', '生成失败', '重新回答'];
+
+    // ★ 不依赖 page.viewportSize()（launchPersistentContext 默认 viewport 为 null），
+    //   改用 getBoundingClientRect + window.innerHeight 判断按钮是否在视口下半部分
+    const isInBottomHalf = async (btn) => {
+      try {
+        const result = await btn.evaluate((el) => {
+          const rect = el.getBoundingClientRect();
+          return { centerY: rect.top + rect.height / 2, vh: window.innerHeight };
+        });
+        if (!result || !result.vh) return true; // 无法获取时退化为原行为
+        return result.centerY > result.vh * 0.45;
+      } catch (_) {
+        return false;
+      }
+    };
+
     try {
       const buttons = page.locator('button, [role="button"]');
       const count = await buttons.count();
-      for (let i = 0; i < count; i++) {
+      // 从后往前扫描，优先最新的按钮（新消息的按钮在 DOM 中靠后）
+      for (let i = count - 1; i >= 0; i--) {
         const btn = buttons.nth(i);
         try {
-          // 同时检查 text、aria-label、title（新版按钮可能无文字，只有 aria/title）
           let text = '';
           let aria = '';
           let title = '';
@@ -280,8 +299,8 @@ async function main() {
           for (const pattern of retryPatterns) {
             if (combined.includes(pattern)) {
               const visible = await btn.isVisible({ timeout: 1500 });
-              if (visible) {
-                console.log('[重试检测] 发现重试按钮: "' + combined.trim() + '"');
+              if (visible && await isInBottomHalf(btn)) {
+                console.log('[重试检测] 发现重试按钮（视口下半部分）: "' + combined.trim() + '"');
                 return btn;
               }
             }
@@ -291,10 +310,11 @@ async function main() {
     } catch (e) { }
     try {
       const warningBtns = page.locator('[role="button"].ds-button--warning, button.ds-button--warning');
-      if (await warningBtns.count() > 0) {
-        const btn = warningBtns.first();
-        if (await btn.isVisible({ timeout: 1500 })) {
-          console.log('[重试检测] 发现 warning 按钮');
+      const wCount = await warningBtns.count();
+      for (let i = wCount - 1; i >= 0; i--) {
+        const btn = warningBtns.nth(i);
+        if (await btn.isVisible({ timeout: 1500 }) && await isInBottomHalf(btn)) {
+          console.log('[重试检测] 发现 warning 按钮（视口下半部分）');
           return btn;
         }
       }
@@ -854,6 +874,51 @@ async function main() {
 
     clearInterval(retryCheckTimer);
 
+    // ★ 流结束（正常 FINISHED 或超时）后，flush 剩余缓冲内容
+    //   修复：模型正文以 "<" 等工具标签前缀结尾时，这部分被 isToolTagPrefix 缓冲，
+    //   onDelta 从未输出，导致流式/非流式返回的文本尾部被截断。
+    //
+    //   ★ 仅在未触发 limitExceeded / DSML 泛滥时执行：
+    //     这两个分支会开新对话重发，若此时 flush 输出，客户端会收到重复内容。
+    //   ★ 尾部若包含完整工具块 + 后续正文（扫描逻辑因停滞 break），
+    //     提取最后一个工具块结束标记之后的正文输出，避免整段丢弃。
+    if (!limitExceeded && dsmlFloodCount <= DSML_FLOOD_LIMIT) {
+      sseDeltaHandler = null;
+      if (outputLen < fullContent.length && onDelta) {
+        const remaining = fullContent.slice(outputLen);
+        const N2 = '(?:DSML|[^a-zA-Z0-9_/>])*';
+        const cleanTail = (s) => s
+          .replace(new RegExp('</?' + N2 + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+          .replace(/DSML/gi, '');
+
+        let textToEmit = '';
+        if (inToolBlock || isToolTagPrefix(remaining)) {
+          // 尾部以工具块/工具标签开头：找到最后一个工具标签闭合标记，提取之后的正文
+          const endRe = new RegExp('</' + N2 + '(?:calls|invoke|parameter)(?=[\\s>])[^>]*>', 'gi');
+          let lastEnd = -1;
+          let m;
+          while ((m = endRe.exec(remaining)) !== null) lastEnd = m.index + m[0].length;
+          if (lastEnd > 0) {
+            textToEmit = cleanTail(remaining.slice(lastEnd));
+          }
+          if (!textToEmit) {
+            console.log('[SSE] 尾部缓冲为未完成的工具标签，丢弃:', JSON.stringify(remaining.slice(0, 60)));
+          }
+        } else {
+          // 普通文本：清洗工具标签后输出
+          textToEmit = cleanTail(remaining);
+        }
+        if (textToEmit) {
+          try { onDelta(textToEmit); } catch (e) {}
+          console.log('[SSE] flush 尾部缓冲内容，长度:', textToEmit.length);
+        }
+        outputLen = fullContent.length;
+      }
+    } else {
+      // limitExceeded 或 DSML 泛滥：不 flush，避免与重发内容重复
+      sseDeltaHandler = null;
+    }
+
     // ★ DSML 泛滥触发中止：开新对话，避免污染历史
     if (dsmlFloodCount > DSML_FLOOD_LIMIT) {
       sseDeltaHandler = null;
@@ -883,11 +948,19 @@ async function main() {
       return null;
     }
 
-    if (fullContent && !timedOut) {
+    // ★ 超时也返回已收到的内容：超长文本超时不该"全丢"
+    //   - 正常完成：返回完整内容
+    //   - 超时但有部分内容：返回已收到的部分（标记日志，客户端能拿到大部分）
+    //   - 完全空：才走重试
+    if (fullContent) {
       sseDeltaHandler = null;
-      console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
-      console.log('\x1b[32m[DEBUG] 长度:\x1b[0m', fullContent.length);
-      console.log('\x1b[32m[DEBUG] 前 200 字符:\x1b[0m', fullContent.slice(0, 200));
+      if (timedOut) {
+        console.log(`\x1b[33m[DEBUG] SSE 超时但已收到 ${fullContent.length} 字符，返回已收到的部分\x1b[0m`);
+      } else {
+        console.log('\x1b[32m[DEBUG] === 收到回复 ===\x1b[0m');
+        console.log('\x1b[32m[DEBUG] 长度:\x1b[0m', fullContent.length);
+        console.log('\x1b[32m[DEBUG] 前 200 字符:\x1b[0m', fullContent.slice(0, 200));
+      }
       return fullContent;
     } else {
       // 超时 或 正文为空
@@ -1308,8 +1381,14 @@ async function main() {
             pos = pos + mc.index + mc[0].length;
           }
 
-          // 剥离可能的嵌套 CDATA 标记，取真实值
-          pValue = pValue.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim();
+          // ★ 不无差别 trim：代码类参数的首尾空白是语义的一部分
+          //   - CDATA 包裹：完全保留原样（CDATA 明确表达"内容边界"）
+          //   - 非 CDATA：只去掉"纯换行包裹"（首尾各一个 \n 是标签排版噪声），
+          //     保留空格和缩进
+          pValue = pValue.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
+          // 去掉首尾各一个换行（仅当首/尾字符就是换行时）
+          if (pValue.startsWith('\n')) pValue = pValue.slice(1);
+          if (pValue.endsWith('\n')) pValue = pValue.slice(0, -1);
 
           // 类型转换：优先依据标签上的 string 属性；没有该属性时才回退到"纯数字自动转 Number"的启发式
           if (stringAttr === 'true') {
@@ -1547,16 +1626,8 @@ async function main() {
           parseResult = parseToolCall(rawOutput, toolNames, toolSchemas);
           if (!parseResult.found) {
             console.log('[ToolCall] 模型仍未输出工具调用，将其视为最终回复');
-            const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
-            const uiNoise = /^(复制|下载|运行|调试|代码)$/;
             let finalText = rawOutput
               .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-              .split('\n')
-              .filter(line => {
-                const t = line.trim();
-                return t !== '' && !langKeywords.test(t) && !uiNoise.test(t);
-              })
-              .join('\n')
               .trim();
             const cleaned = cleanTaskCompletedMark(stripDsmlTags(finalText));
             return { toolCall: null, toolCalls: [], rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null,emittedContent };
@@ -1569,18 +1640,13 @@ async function main() {
           || '【系统提示】工具调用格式持续错误，请重试或换一种表达方式。';
         return { toolCall: null, toolCalls: [], rawOutput: fallbackText, assistantContent: null,emittedContent };
       } else {
-        // 没有任何工具调用标签，直接返回纯文本（finish_reason: stop）
-        // 清洗 UI 杂讯，仅在纯文本模式下进行
-        const langKeywords = /^(java|text|python|javascript|js|typescript|go|ruby|rust|c|cpp|csharp|bash|shell|powershell|sql|html|css|xml|json|yaml|swift|kotlin|scala|perl|php|r|dart|elixir|erlang|haskell|clojure|lua|matlab|objective-c|rust)$/i;
-        const uiNoise = /^(复制|下载|运行|调试|代码)$/;
+        // ★ 不删 langKeywords/uiNoise：
+        //   __onSSEDelta 拦截的是 XHR responseText，里面只有模型 token，
+        //   不含 UI 按钮文字（"复制"/"下载"）。删除会误删模型本意输出的独立行。
+        //   只清理"专家模式暂不支持搜索"这类明确的 UI 提示。
         let cleanText = rawOutput
           .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
-          .split('\n')
-          .filter(line => {
-            const t = line.trim();
-            return t !== '' && !langKeywords.test(t) && !uiNoise.test(t);
-          })
-          .join('\n');
+          .trim();
         const cleaned = cleanTaskCompletedMark(stripDsmlTags(cleanText));
         return { toolCall: null, rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null,emittedContent };
       }
@@ -1679,12 +1745,12 @@ async function main() {
                 for (const msg of messages) {
                   if (msg.role === 'system') {
                     const rawContent = extractTextContent(msg.content);
-                    text += `【系统提示】\n${rawContent.slice(0, 2000)}`;
+                    text += `【系统提示】\n${rawContent}`;
                   }
                 }
 
                 if (userMsg) {
-                  text += `【用户消息】\n${userMsg.slice(0, 2000)}`;
+                  text += `【用户消息】\n${userMsg}`;
                 }
 
                 // ★ 找到最后一条 user 的索引
@@ -1816,12 +1882,34 @@ async function main() {
 
               // 流式剥离 <...>：用一个缓冲区处理跨 chunk 的"半个标签"
               let streamBuf = '';
+              // ★ 判断字符串是否是（不完整的）工具标签前缀，与 sendAndWait 中的逻辑一致
+              const isToolTagPrefixStr = (s) => {
+                if (!s || s[0] !== '<') return false;
+                let idx = 1;
+                if (s[idx] === '/') idx++;
+                while (idx < s.length) {
+                  if (s.startsWith('DSML', idx)) { idx += 4; continue; }
+                  if (!/[a-zA-Z0-9_/>]/.test(s[idx])) { idx++; continue; }
+                  const remain = s.slice(idx);
+                  if (remain.length <= 4 && 'DSML'.startsWith(remain)) return true;
+                  break;
+                }
+                if (idx >= s.length) return true;
+                const tailStr = s.slice(idx);
+                for (const tag of ['calls', 'invoke', 'parameter']) {
+                  if (tailStr.length <= tag.length) {
+                    if (tag.slice(0, tailStr.length) === tailStr) return true;
+                  } else if (tailStr.startsWith(tag)) {
+                    const next = tailStr[tag.length];
+                    if (!/[a-zA-Z0-9_]/.test(next)) return true;
+                  }
+                }
+                return false;
+              };
               const flushStream = (force = false) => {
                 if (responseEnded || !res.writable || !streamBuf) return;
                 // 尾部若存在未闭合的 '<'，从"最靠前的那个未闭合 '<'"开始暂存，
                 // 避免多个未闭合标签时前面的半截被误 emit
-                //   - 非 force：暂存到下次，等下一帧补全
-                //   - force：直接丢弃半截
                 const gtIdx = streamBuf.lastIndexOf('>');
                 const tail = streamBuf.slice(gtIdx + 1);
                 const firstLtInTail = tail.indexOf('<');
@@ -1829,7 +1917,44 @@ async function main() {
                 if (firstLtInTail !== -1) {
                   const cutIdx = gtIdx + 1 + firstLtInTail;
                   toEmit = streamBuf.slice(0, cutIdx);
-                  streamBuf = force ? '' : streamBuf.slice(cutIdx);
+                  const rest = streamBuf.slice(cutIdx);
+                  if (force) {
+                    // ★ 修复：force 时按 rest 的形态分类处理，避免误删正文：
+                    //   - rest 以完整工具标签开头（如 </calls>后续正文）：提取最后一个闭合标签之后的正文保留
+                    //   - rest 是未完成的工具标签前缀（如 <c、<inv、</par 等）：丢弃
+                    //   - rest 是普通文本（如 "a < b" 中的 "< b"）：保留
+                    if (rest) {
+                      const N2 = '(?:DSML|[^a-zA-Z0-9_/>])*';
+                      const tagAtStart = rest.match(new RegExp('^</?' + N2 + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'i'));
+                      if (tagAtStart) {
+                        // rest 以完整工具标签开头：找最后一个闭合标签，提取之后的正文
+                        const closeRe = new RegExp('</' + N2 + '(?:calls|invoke|parameter)(?=[\\s>])[^>]*>', 'gi');
+                        let lastClose = -1;
+                        let cm;
+                        while ((cm = closeRe.exec(rest)) !== null) lastClose = cm.index + cm[0].length;
+                        let cleanedRest = '';
+                        if (lastClose >= 0) {
+                          cleanedRest = rest.slice(lastClose)
+                            .replace(new RegExp('</?' + N2 + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+                            .replace(/DSML/gi, '');
+                        }
+                        if (cleanedRest && isToolTagPrefixStr(cleanedRest)) {
+                          console.log('[HTTP] 流结束时丢弃未完成的工具标签前缀:', JSON.stringify(cleanedRest.slice(0, 60)));
+                          cleanedRest = '';
+                        }
+                        if (cleanedRest) toEmit += cleanedRest;
+                        else console.log('[HTTP] 流结束时丢弃未完成的工具标签块:', JSON.stringify(rest.slice(0, 60)));
+                      } else if (isToolTagPrefixStr(rest)) {
+                        console.log('[HTTP] 流结束时丢弃未完成的工具标签前缀:', JSON.stringify(rest.slice(0, 60)));
+                      } else {
+                        // 普通文本，保留
+                        toEmit += rest;
+                      }
+                    }
+                    streamBuf = '';
+                  } else {
+                    streamBuf = rest;
+                  }
                 } else {
                   toEmit = streamBuf;
                   streamBuf = '';
@@ -1845,6 +1970,7 @@ async function main() {
                   choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }]
                 })}\n\n`);
               };
+              
               const onDelta = (delta) => {
                 if (responseEnded || !res.writable) return;
                 streamBuf += delta;
@@ -1960,12 +2086,16 @@ async function main() {
                     })}\n\n`);
                   }
 
-                  // 逐步发送 arguments
-                  for (let i = 0; i < argsStr.length; i++) {
+                  // ★ 分块发送 arguments（每块 200 字符，每块间隔 5ms）
+                  //   逐字符 × 5ms 对 50KB 参数要 250 秒，客户端会超时
+                  //   分块后：50KB / 200 × 5ms = 1.25 秒
+                  const ARGS_CHUNK = 200;
+                  for (let i = 0; i < argsStr.length; i += ARGS_CHUNK) {
                     if (!alive()) break;
+                    const chunk = argsStr.slice(i, i + ARGS_CHUNK);
                     res.write(`data: ${JSON.stringify({
                       id: chunkId, object: 'chat.completion.chunk', created, model,
-                      choices: [{ index: 0, delta: { tool_calls: [{ index: tcIdx, function: { arguments: argsStr[i] } }] }, finish_reason: null }]
+                      choices: [{ index: 0, delta: { tool_calls: [{ index: tcIdx, function: { arguments: chunk } }] }, finish_reason: null }]
                     })}\n\n`);
                     await new Promise(r => setTimeout(r, 5));
                   }
