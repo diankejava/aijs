@@ -124,6 +124,81 @@ async function main() {
         console.log('警告: 保存登录凭证失败。');
     }
   }
+  // ★ XHR SSE 拦截器脚本（可被 addInitScript 与 evaluate 复用）
+  //   - addInitScript：在页面脚本之前执行，每次真实导航自动重新执行，SPA 无法覆盖
+  //   - evaluate：作为 SPA 内部路由跳转后 XHR 被覆盖的罕见场景的补充
+  //   - window.__sseInjected 守卫：保证同一页面内只包装一次，避免拦截器嵌套/重复推送
+  function getSSEInterceptorScript() {
+    return () => {
+      // ★ 守卫改为"检查当前 send 是否仍是我们的包装"：
+      //   - 初次注入：XMLHttpRequest.prototype.send 没有 __sseWrapped 标记 → 注入
+      //   - SPA 重写了 XHR（框架常见）：send 被替换，__sseWrapped 丢失 → 重新注入
+      //   - 已注入且未被覆盖：send.__sseWrapped 为 true → 跳过，避免嵌套包装
+      //   注意：仅靠 window.__sseInjected 会漏掉"SPA 覆盖后无法恢复"的场景 → chunk=0。
+      if (XMLHttpRequest.prototype.send && XMLHttpRequest.prototype.send.__sseWrapped) return;
+      window.__sseInjected = true;
+
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__url = url;
+        return origOpen.call(this, method, url, ...rest);
+      };
+
+      const wrappedSend = function(...args) {
+        if (this.__url && String(this.__url).includes('/api/v0/chat/completion')) {
+          if (window.__onSSERequest) window.__onSSERequest();
+          let lastLen = 0;
+          const flush = () => {
+            try {
+              const text = this.responseText || '';
+              if (text.length > lastLen) {
+                const delta = text.slice(lastLen);
+                lastLen = text.length;
+                if (window.__onSSEDelta) window.__onSSEDelta(delta);
+              }
+            } catch (e) {}
+          };
+          this.addEventListener('progress', flush);
+          this.addEventListener('load', flush);
+          this.addEventListener('loadend', () => {
+            flush();
+            if (window.__onSSEDelta) window.__onSSEDelta('\n');
+          });
+        }
+        return origSend.call(this, ...args);
+      };
+      wrappedSend.__sseWrapped = true;   // ★ 标记，供重复注入时判断
+      XMLHttpRequest.prototype.send = wrappedSend;
+    };
+  }
+
+  // ★ 确保 XHR SSE 拦截已注入当前页面（幂等）
+  //   - exposeFunction：Playwright 在导航后会自动重新暴露，重复调用抛错被忽略
+  //   - evaluate：用 __sseInjected 守卫，与 addInitScript 互斥，避免重复包装
+  async function ensureSSEInjected(targetPage) {
+    if (!targetPage) return;
+    // ★ __onSSEDelta / __onSSERequest 已由 context 级 exposeFunction 绑定（initBrowserAndPage 中），
+    //   这里保留兜底调用，兼容 context 级绑定失败或被覆盖的边缘场景。
+    //   重复调用会抛错，被 catch 忽略，无副作用。
+    try {
+      await targetPage.exposeFunction('__onSSEDelta', (chunk) => {
+        if (sseDeltaHandler) sseDeltaHandler(chunk);
+      });
+    } catch (_) { /* 已注册或页面正在导航，忽略 */ }
+    try {
+      await targetPage.exposeFunction('__onSSERequest', () => {
+        sseRequestSeq++;
+        console.log('[SSE] 新的 completion 请求 #' + sseRequestSeq + '（判断是否分多请求输出）');
+      });
+    } catch (_) { /* 已注册或页面正在导航，忽略 */ }
+    // 补注入 XHR 拦截器：覆盖 SPA 内部路由后 XHR 被第三方脚本重写的场景
+    try {
+      await targetPage.evaluate(getSSEInterceptorScript());
+    } catch (e) {
+      console.log('[SSE] 注入失败（页面可能正在导航）:', e.message);
+    }
+  }
 
   // 初始化浏览器和页面
   async function initBrowserAndPage() {
@@ -176,6 +251,73 @@ async function main() {
 
     const newPage = newBrowser.pages()[0] || await newBrowser.newPage();
 
+    // ★ 关键修复 A：context 级 exposeFunction 绑定 __onSSEDelta / __onSSERequest
+    //   根因：page.exposeFunction 只对单个页面生效；browser.on('page') 里等 waitForSelector 成功
+    //         才调用 ensureSSEInjected，导致新标签页加载期间 window.__onSSEDelta 缺失，
+    //         addInitScript 注入的 XHR 拦截器拿到数据后无处推送 → 静默丢弃 → chunk=0。
+    //   修复：context 级一次性绑定，所有页面（含未来打开的标签页）自动获得这两个函数，
+    //         无需等待页面就绪即可接收 completion 增量。
+    try {
+      await newBrowser.exposeFunction('__onSSEDelta', (chunk) => {
+        if (sseDeltaHandler) sseDeltaHandler(chunk);
+      });
+    } catch (_) { /* 已注册，忽略 */ }
+    try {
+      await newBrowser.exposeFunction('__onSSERequest', () => {
+        sseRequestSeq++;
+        console.log('[SSE] 新的 completion 请求 #' + sseRequestSeq + '（判断是否分多请求输出）');
+      });
+    } catch (_) { /* 已注册，忽略 */ }
+
+    // ★ 关键修复 B：用 addInitScript 注册 XHR 拦截器
+    //   - 它在页面脚本之前执行，SPA 初始化时无法覆盖
+    //   - 每次真实导航（goto / reload）都会自动重新执行，新 window 的 __sseInjected 为 undefined，会重新包装
+    //   - 注册在 context 级别：所有页面（含新标签页、window.open 弹窗）都会自动注入
+    //   - 修复 "新标签/新对话后 chunk=0、模型已输出但程序未收到" 的问题
+    await newBrowser.addInitScript(getSSEInterceptorScript());
+
+    // ★ 若页面内 window.open / target="_blank" 打开新标签，全局 page 需要跟随切换，
+    //   否则 findEditor / findSendButton / ensureSSEInjected 都在旧页面上操作。
+    //   策略：新页面出现时，若它是主站域名 + 有可见输入框，则切换到新页面
+    //   （用户主动打开新标签通常是想要在新标签操作，不能因旧页还有输入框而拒绝）
+    newBrowser.on('page', async (newP) => {
+      try {
+        // ★ 无条件先注入 SSE 回调 + XHR 拦截器：
+        //   1. newP.url() 在 page 事件触发时通常是 about:blank，若用 URL 判断会跳过注入，
+        //      若 BrowserContext.exposeFunction 不可用（老版本 Playwright），新页永远没有
+        //      window.__onSSEDelta → XHR 拦截器拿到数据后无处推送 → chunk=0。
+        //   2. 页面正在导航时注入失败会被 catch；URL 判断通过后会再注入一次（evaluate 幂等）。
+        try { await ensureSSEInjected(newP); } catch (_) {}
+
+        await newP.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+        const newUrl = newP.url() || '';
+        const platformHost = new URL(platform.url).host;
+        // ★ 只切换主站域名的页：window.open('https://chat.deepseek.com/...') 在 page 事件
+        //   触发时 URL 已是主站；不需要接受 about:blank 过渡态。
+        //   撤销上一轮的 isUserOpenedTab：用户手动打开空白标签时会被误切换，
+        //   导致每次请求前 sendAndWait 兜底等 30 秒。
+        if (!newUrl.includes(platformHost)) return;
+
+        // ★ 关键修复：域名匹配后立即切换 page（用户打开新标签页就是要在这边操作），
+        //   不再等 waitForSelector 30 秒；否则用户在新页操作期间 page 仍指旧页，
+        //   消息会被 sendAndWait 发到旧页，模型在新页的输出无人接收 → chunk=0 / 长时间等待。
+        console.log('[浏览器] 检测到新标签页，立即切换 page 到:', newUrl);
+        page = newP;
+        try { await ensureSSEInjected(page); } catch (_) {}
+
+        // waitForSelector 仅用于日志（观察新页输入框就绪时间），不阻塞 page 切换
+        const editorSelector = platform.editor.split(',')[0].trim();
+        try {
+          await newP.waitForSelector(editorSelector, { state: 'visible', timeout: 30000 });
+          console.log('[浏览器] 新标签页输入框已就绪');
+        } catch (_) {
+          console.log('[浏览器] 新标签页输入框 30 秒内未就绪，sendAndWait 会在发送时等待');
+        }
+      } catch (e) {
+        console.log('[浏览器] 新标签页切换失败:', e.message);
+      }
+    });
+
     await newPage.goto(platform.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     console.log(`页面已打开，等待登录到 ${platform.name}...`);
 
@@ -183,49 +325,7 @@ async function main() {
     console.log('登录成功！可以开始对话了。\n');
 
     // 注入 SSE 流式拦截：把 completion 响应的增量实时推给 Node（用于流式返回）
-    await newPage.exposeFunction('__onSSEDelta', (chunk) => {
-      if (sseDeltaHandler) sseDeltaHandler(chunk);
-    });
-    await newPage.exposeFunction('__onSSERequest', () => {
-      sseRequestSeq++;
-      console.log('[SSE] 新的 completion 请求 #' + sseRequestSeq + '（判断是否分多请求输出）');
-    });
-    await newPage.evaluate(() => {
-      if (window.__sseInjected) return;
-      window.__sseInjected = true;
-      // DeepSeek 用 XHR 发送 completion 请求，拦截 XHR 实时读取 SSE 增量
-      const origOpen = XMLHttpRequest.prototype.open;
-      const origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        this.__url = url;
-        return origOpen.call(this, method, url, ...rest);
-      };
-      XMLHttpRequest.prototype.send = function(...args) {
-        if (this.__url && String(this.__url).includes('/api/v0/chat/completion')) {
-          if (window.__onSSERequest) window.__onSSERequest();
-          let lastLen = 0;
-          const flush = () => {
-            try {
-              const text = this.responseText || '';
-              if (text.length > lastLen) {
-                const delta = text.slice(lastLen);
-                lastLen = text.length;
-                if (window.__onSSEDelta) window.__onSSEDelta(delta);
-              }
-            } catch (e) {}
-          };
-          // progress 事件的 responseText 可能滞后，用 load/loadend 兜底，确保最后一段数据不丢
-          this.addEventListener('progress', flush);
-          this.addEventListener('load', flush);
-          this.addEventListener('loadend', () => {
-            flush();
-            // 强制补一个换行，把解析器 buffer 里的最后一行（FINISHED 信号）刷出来
-            if (window.__onSSEDelta) window.__onSSEDelta('\n');
-          });
-        }
-        return origSend.call(this, ...args);
-      };
-    });
+    await ensureSSEInjected(newPage);
 
     return { browser: newBrowser, page: newPage };
   }
@@ -369,6 +469,8 @@ async function main() {
       // 兜底：直接导航到主页
       await page.goto(platform.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(2000);
+      // ★ 导航后 exposeFunction 与 evaluate 注入都会失效，必须重新注入
+      await ensureSSEInjected(page);
       console.log('[新对话] 已通过导航到主页重置对话');
       return true;
     } catch (e) {
@@ -466,15 +568,101 @@ async function main() {
     };
   }
 
+  async function syncActivePage() {
+    if (!browser || !browser.pages) return;
+    const platformHost = new URL(platform.url).host;
+    const pages = browser.pages();
+    for (const p of pages) {
+      if (p === page || p.isClosed()) continue;
+      try {
+        // ★ 只切换主站域名的前台页：
+        //   - 不看 editorSelector（页面加载中可能未就绪）
+        //   - 但必须过滤 URL：否则用户打开无关页（广告/扩展/chrome://）并聚焦时，
+        //     会被误切 → sendAndWait 每次都要走兜底遍历 + 15 秒 waitForSelector
+        const url = p.url() || '';
+        if (!url.includes(platformHost)) continue;
+        const focused = await p.evaluate(() => document.hasFocus() && document.visibilityState === 'visible').catch(() => false);
+        if (!focused) continue;
+        console.log('[浏览器] 检测到前台活跃页，切换 page:', url);
+        page = p;
+        await ensureSSEInjected(page);
+        return;
+      } catch (_) {}
+    }
+  }
+
   async function sendAndWait(text, cancelState = null, onDelta = null, retryCount = 0, fullText = null) {
     console.log('\x1b[36m[DEBUG] === 发送消息 ===\x1b[0m');
     console.log('\x1b[36m[DEBUG] 内容:\x1b[0m', text.slice(0, 100));
 
-    const editor = await findEditor();
+    await syncActivePage();
+    // ★ 发送前保底注入：任何页面导航（新对话、超限重置、崩溃恢复等）都会导致注入失效，
+    //   这里是最后一道防线，确保本次发送一定能收到 SSE 增量。
+    await ensureSSEInjected(page);
+
+    // ★ 兜底：若当前 page 无可见输入框
+    //   1) 如果当前 page 是主站域名，或正处于 about:blank / 空 URL（新标签页刚打开、页面加载中）：
+    //      等当前页 editor 就绪，不切走（否则会切回旧页，导致消息发到旧页、新页模型输出无人接收）
+    //      ★ 关键：about:blank 时若只判断 includes(platformHost) 会返回 false，
+    //         进入情况 2 把 page 切回旧页 → 新页模型输出无人接收 → chunk=0 / 长时间等待
+    //   2) 如果当前 page 是无关页面（chrome:// / devtools / 第三方域名）：遍历其他主站页兜底切换
+    let editor = await findEditor();
+    if (!editor) {
+      const platformHost = new URL(platform.url).host;
+      const editorSelector = platform.editor.split(',')[0].trim();
+      const currentUrl = (page && !page.isClosed()) ? (page.url() || '') : '';
+
+      // 判断当前 page 是否"应该等它就绪"：
+      //   - 主站域名：用户在该页操作
+      //   - '' / about:blank / about:xxx：新标签页加载中的过渡状态
+      const shouldWaitCurrent =
+        currentUrl.includes(platformHost) ||
+        currentUrl === '' ||
+        currentUrl.startsWith('about:');
+
+      if (shouldWaitCurrent && page && !page.isClosed()) {
+        try {
+          await page.waitForSelector(editorSelector, { state: 'visible', timeout: 30000 });
+          console.log('[浏览器] 当前页输入框已就绪，使用当前 page');
+          editor = await findEditor();
+        } catch (_) {
+          console.log('[浏览器] 当前页输入框 30 秒内未就绪，尝试兜底切换');
+        }
+      }
+
+      // 情况 2：当前 page 无 editor 且非主站/加载中，或等待超时 → 遍历其他主站页兜底
+      if (!editor && browser && browser.pages) {
+        for (const p of browser.pages()) {
+          if (p === page || p.isClosed()) continue;
+          try {
+            const url = p.url() || '';
+            if (!url.includes(platformHost)) continue;
+            try {
+              await p.waitForSelector(editorSelector, { state: 'visible', timeout: 15000 });
+            } catch (_) {
+              continue;
+            }
+            console.log('[浏览器] 兜底切换：切换到就绪的主站页:', url);
+            page = p;
+            await ensureSSEInjected(page);
+            editor = await findEditor();
+            if (editor) break;
+          } catch (_) {}
+        }
+      }
+    }
+
     if (!editor) {
       console.log('[HTTP] 错误: 未找到输入框');
       throw new Error('未找到输入框');
     }
+
+    // ★ 在兜底逻辑确定最终 page 之后才取快照：
+    //   - 若在兜底之前取，兜底切换 page 后 requestPage 会指向旧页
+    //   - 导致 retryCheckTimer 的 `page !== requestPage` 永远 true → 永久失效，
+    //     等待期间无法自动处理"超时重试"按钮
+    //   - 且 isOverLimit 在错误的页面上检测，可能漏检超限提示
+    const requestPage = page;
 
     if (platformKey === 'deepseek') {
       try {
@@ -823,20 +1011,29 @@ async function main() {
     }
 
     // 检测超限提示（限制在通知/错误区域）
-    const isOverLimit = await page.evaluate(() => {
-      const regex = /(over limit|超出限制|超过限制|超出).?\d+%/i;
-      // 优先搜索通知容器
-      const containers = document.querySelectorAll('.ds-notification-container, .ds-toast, .ds-message, .ds-alert, [class*="notification"]');
-      const searchRoots = containers.length > 0 ? containers : [document.body];
-      for (const root of searchRoots) {
-        const text = root.textContent.trim();
-        if (regex.test(text)) return text;
-      }
-      return null;
-    });
+    // ★ try-catch：紧跟 sendBtn.click 之后，若页面正在跳转，evaluate 会抛
+    //   "Execution context was destroyed"，会污染整个 sendAndWait → 500。
+    //   这里视为"未检测到超限"，继续正常等待 SSE。
+    const checkPage = (requestPage && !requestPage.isClosed()) ? requestPage : page;
+    let isOverLimit = null;
+    try {
+      isOverLimit = await checkPage.evaluate(() => {
+        const regex = /(over limit|超出限制|超过限制|超出).?\d+%/i;
+        const containers = document.querySelectorAll('.ds-notification-container, .ds-toast, .ds-message, .ds-alert, [class*="notification"]');
+        const searchRoots = containers.length > 0 ? containers : [document.body];
+        for (const root of searchRoots) {
+          const text = root.textContent.trim();
+          if (regex.test(text)) return text;
+        }
+        return null;
+      });
+    } catch (e) {
+      console.log('[HTTP] 超限检测 evaluate 失败（页面可能跳转中）:', e.message);
+    }
 
     if (isOverLimit) {
       console.log(`\x1b[31m[ERROR] 检测到上下文超限: ${isOverLimit}\x1b[0m`);
+      sseDeltaHandler = null;
       return null;
     }
 
@@ -846,6 +1043,8 @@ async function main() {
     // 定期检测页面上的「重试」按钮（DeepSeek 提交后服务端超时会显示「超时重试」），检测到就点击并重置累积
     const retryCheckTimer = setInterval(async () => {
       try {
+        // ★ 若 page 已被切换到其他页面，跳过本次检测，避免误触新页的重试按钮
+        if (page !== requestPage) return;
         const retryBtn = await detectRetryButton();
         if (retryBtn) {
           console.log('[DEBUG] 等待中检测到重试按钮，自动点击并重置累积...');
@@ -967,7 +1166,8 @@ async function main() {
       if (!timedOut) {
         // FINISHED 但正文为空：先保持监听等待几秒，看是否有后续 completion 请求带正文到来（深度思考可能分多请求输出）
         console.log('[DEBUG] FINISHED 但正文为空，等待后续请求 5 秒...');
-        await page.waitForTimeout(5000);
+        // ★ 用 setTimeout 而非 page.waitForTimeout：page 已关闭时后者会抛 Target closed
+        await new Promise(r => setTimeout(r, 5000));
         if (fullContent) {
           sseDeltaHandler = null;
           console.log('\x1b[32m[DEBUG] 后续请求带来了正文，长度:\x1b[0m', fullContent.length);
@@ -989,6 +1189,9 @@ async function main() {
           let fullContent2 = '';
           const parser2 = createSSEParser(
             (delta) => { fullContent2 += delta; if (onDelta) { try { onDelta(delta); } catch (e) {} } },
+            () => { finishedResolve2(); },
+            // ★ 重试也需监听超限信号：否则 onLimitExceeded 为 undefined 时抛错被吞，
+            //   finishedPromise2 永远 pending，直到 5 分钟超时。
             () => { finishedResolve2(); }
           );
           sseDeltaHandler = (chunk) => { try { parser2(chunk); } catch (e) {} };
@@ -1005,8 +1208,7 @@ async function main() {
           console.log('[DEBUG] 重试后仍未收到回复');
         } else {
           console.log('[DEBUG] 未检测到重试按钮，重新发送消息重试...');
-          await page.waitForTimeout(1000);
-          // ★ 传递 fullText，避免超时重试后再超限时丢失新会话版本
+          await new Promise(r => setTimeout(r, 1000));
           return sendAndWait(text, cancelState, onDelta, retryCount + 1, fullText);
         }
       }
@@ -1640,15 +1842,11 @@ async function main() {
           || '【系统提示】工具调用格式持续错误，请重试或换一种表达方式。';
         return { toolCall: null, toolCalls: [], rawOutput: fallbackText, assistantContent: null,emittedContent };
       } else {
-        // ★ 不删 langKeywords/uiNoise：
-        //   __onSSEDelta 拦截的是 XHR responseText，里面只有模型 token，
-        //   不含 UI 按钮文字（"复制"/"下载"）。删除会误删模型本意输出的独立行。
-        //   只清理"专家模式暂不支持搜索"这类明确的 UI 提示。
         let cleanText = rawOutput
           .replace(/专家模式暂不支持搜索，请使用快速模式/g, '')
           .trim();
         const cleaned = cleanTaskCompletedMark(stripDsmlTags(cleanText));
-        return { toolCall: null, rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null,emittedContent };
+        return { toolCall: null, toolCalls: [], rawOutput: cleaned || stripDsmlTags(rawOutput), assistantContent: null,emittedContent };
       }
     }
 
@@ -1713,8 +1911,6 @@ async function main() {
               return;
             }
 
-            const MAX_HISTORY = 20;
-            const recentMessages = messages.slice(-MAX_HISTORY);
             const historyNoise = /^(复制|下载|运行|调试|代码)$/;
 
             // ★ 构建两个版本的 prompt：
@@ -1819,7 +2015,6 @@ async function main() {
             // ★ 程序启动后第一次请求：服务端上下文为空，必须用完整历史建立上下文
             //   之后依赖服务端上下文，用 promptText（system + 最新 user）
             let actualPromptText = promptText;
-            let actualFullPromptText = fullPromptText;
             if (isFirstRequestAfterStart) {
               isFirstRequestAfterStart = false;
               // 只有 messages 里有实质历史（> system + 1 user）时才需要切换
