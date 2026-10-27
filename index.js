@@ -1088,6 +1088,8 @@ async function main() {
         const N2 = '(?:DSML|[^a-zA-Z0-9_/>])*';
         const cleanTail = (s) => s
           .replace(new RegExp('</?' + N2 + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+          // ★ 畸形空标签（覆盖所有 Unicode 竖线变体，保留中文/日文/韩文字母）
+          .replace(/<\/?[^\p{L}\p{N}\s!\/][^>]*>/gu, '')
           .replace(/DSML/gi, '');
 
         let textToEmit = '';
@@ -1728,7 +1730,6 @@ async function main() {
      */
     function stripDsmlTags(text) {
       if (!text) return text;
-      // 统一噪声类：DSML 整体识别 + 任意非字母数字下划线斜杠尖括号的字符
       const N = '(?:DSML|[^a-zA-Z0-9_/>])*';
       return text
         // 1. 配对块（开/闭标签名前都允许任意噪声）
@@ -1737,7 +1738,12 @@ async function main() {
         .replace(new RegExp('</?' + N + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
         // 3. 纯 parameter 开标签（模型漏写 invoke 包裹时）
         .replace(new RegExp('<' + N + 'parameter\\b[^>]*>', 'gi'), '')
-        // 4. 清理可能残留的 DSML 字面量
+        // ★ 4. 畸形空标签：标签名首字符不是 Unicode 字母/数字/空白/!/斜杠 的尖括号标签一律删除
+        //    覆盖所有 Unicode 竖线变体（｜ U+FF5C、| U+007C、│ U+2502、︱ U+FE31、❘ U+2758 等）
+        //    保留：<div>、<T>、<https://...>、<3>、<!-- -->、<![CDATA[]]>、a < b > c
+        //         以及中文/日文/韩文标签：<按钮>、<输入框>、<結果>
+        .replace(/<\/?[^\p{L}\p{N}\s!\/][^>]*>/gu, '')
+        // 5. 清理可能残留的 DSML 字面量
         .replace(/DSML/gi, '')
         .trim();
     }
@@ -2158,6 +2164,8 @@ async function main() {
                 const N = '(?:DSML|[^a-zA-Z0-9_/>])*';
                 const cleaned = toEmit
                   .replace(new RegExp('</?' + N + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+                  // ★ 畸形空标签（覆盖所有 Unicode 竖线变体，保留中文/日文/韩文字母）
+                  .replace(/<\/?[^\p{L}\p{N}\s!\/][^>]*>/gu, '')
                   .replace(/DSML/gi, '');
                 if (!cleaned) return;
                 res.write(`data: ${JSON.stringify({
@@ -2437,7 +2445,14 @@ async function main() {
       const reply = await sendAndWait(text);
       process.stdout.write('\x1b[1A\x1b[K');
       if (reply) {
-        console.log(`[${platform.name}]:`, reply, '\n');
+        // ★ 控制台也清理畸形工具标签（stripDsmlTags 定义在 createServer 内部，此处内联等价逻辑）
+        const N = '(?:DSML|[^a-zA-Z0-9_/>])*';
+        const displayReply = reply
+          .replace(new RegExp('</?' + N + '(?:invoke|parameter|calls)(?=[\\s>])[^>]*>', 'gi'), '')
+          .replace(/<\/?[^\p{L}\p{N}\s!\/][^>]*>/gu, '')
+          .replace(/DSML/gi, '')
+          .trim();
+        console.log(`[${platform.name}]:`, displayReply || reply, '\n');
       } else {
         console.log('超时: 未收到回复。\n');
       }
