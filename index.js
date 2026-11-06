@@ -787,7 +787,10 @@ async function main() {
 
     // 设置流式 SSE 解析器（在点击发送前，通过页面内 fetch 拦截实时接收增量）
     let finishedResolve;
-    const finishedPromise = new Promise(resolve => { finishedResolve = resolve; });
+    let isFinished = false; // ★ 标记等待是否已结束（FINISHED / 超限 / DSML 泛滥都会触发）
+    const finishedPromise = new Promise(resolve => {
+      finishedResolve = () => { isFinished = true; resolve(); };
+    });
     let fullContent = '';
     let sseChunkCount = 0;
     let sseRawBytes = 0;
@@ -1041,26 +1044,53 @@ async function main() {
     let timedOut = false;
 
     // 定期检测页面上的「重试」按钮（DeepSeek 提交后服务端超时会显示「超时重试」），检测到就点击并重置累积
+    // ★ 检测到重试按钮后先等待 5 秒再点击：
+    //   - 给服务端/模型一个自愈窗口，避免按钮刚出现就误触
+    //   - 5 秒期间若收到 FINISHED / 超限 / DSML 泛滥（isFinished=true），或 page 被切换，或按钮已消失，则放弃点击
+    //   - isRetryPending 锁：防止 setInterval 每 3 秒重复触发导致并发 5 秒等待 + 重复点击
+    let isRetryPending = false;
     const retryCheckTimer = setInterval(async () => {
+      if (isRetryPending) return;
       try {
-        // ★ 若 page 已被切换到其他页面，跳过本次检测，避免误触新页的重试按钮
         if (page !== requestPage) return;
         const retryBtn = await detectRetryButton();
-        if (retryBtn) {
-          console.log('[DEBUG] 等待中检测到重试按钮，自动点击并重置累积...');
-          await retryBtn.click();
-          fullContent = '';
-          outputLen = 0;
-          inToolBlock = false;
-          toolBlockEnd = '';
-          sseChunkCount = 0;
-          sseRawBytes = 0;
-          // ★ 补齐：重试时也要清零泛滥计数与缓冲时间戳，
-          //   否则上一次尝试累积的标签数会误触发中止/污染新回复
-          dsmlFloodCount = 0;
-          bufferingSince = 0;
+        if (!retryBtn) return;
+
+        isRetryPending = true;
+        console.log('[DEBUG] 等待中检测到重试按钮，5 秒后自动点击并重置累积...');
+        await new Promise(r => setTimeout(r, 5000));
+
+        // 5 秒后二次确认：等待已结束 / page 被切换 / 按钮已消失 → 放弃点击
+        if (isFinished) {
+          console.log('[DEBUG] 5 秒等待期间请求已完成，取消点击重试');
+          return;
         }
-      } catch (e) {}
+        if (page !== requestPage) {
+          console.log('[DEBUG] 5 秒等待期间 page 已切换，取消点击重试');
+          return;
+        }
+        const retryBtnAgain = await detectRetryButton();
+        if (!retryBtnAgain) {
+          console.log('[DEBUG] 5 秒等待后重试按钮已消失，取消点击');
+          return;
+        }
+
+        await retryBtnAgain.click();
+        fullContent = '';
+        outputLen = 0;
+        inToolBlock = false;
+        toolBlockEnd = '';
+        sseChunkCount = 0;
+        sseRawBytes = 0;
+        // ★ 补齐：重试时也要清零泛滥计数与缓冲时间戳，
+        //   否则上一次尝试累积的标签数会误触发中止/污染新回复
+        dsmlFloodCount = 0;
+        bufferingSince = 0;
+      } catch (e) {
+        // 忽略
+      } finally {
+        isRetryPending = false;
+      }
     }, 3000);
 
     await Promise.race([
@@ -1070,6 +1100,10 @@ async function main() {
       console.log('[DEBUG] SSE 等待异常:', e.message);
       timedOut = true;
     });
+
+    // ★ 超时也视为"等待结束"：阻止 retryCheckTimer 的 5 秒等待中的回调在超时后继续点击，
+    //   否则会出现"主流程已超时返回/进入重试，retryCheckTimer 的 5 秒等待结束时又点一次"的重复触发。
+    if (timedOut) isFinished = true;
 
     clearInterval(retryCheckTimer);
 
@@ -1143,6 +1177,7 @@ async function main() {
         //   让模型看到之前的对话上下文，能正常复现任务。
         const retryText = fullText || text;
         console.log(`[新对话] 已开新对话，重新发送消息...（prompt ${retryText.length} 字符，${fullText ? '完整历史' : '原 prompt'}）`);
+        await new Promise(r => setTimeout(r, 10000));
         return sendAndWait(retryText, cancelState, onDelta, retryCount + 1, fullText);
       }
       console.log('[新对话] 重试次数已用尽，返回 null');
@@ -1185,7 +1220,19 @@ async function main() {
       if (retryCount < 1) {
         const retryBtn = await detectRetryButton();
         if (retryBtn) {
-          console.log('[DEBUG] 检测到重试按钮，点击重新生成...');
+          console.log('[DEBUG] 检测到重试按钮，5 秒后点击重新生成...');
+          // ★ 检测到重试按钮后先等待 5 秒，给服务端一个自愈窗口
+          await new Promise(r => setTimeout(r, 5000));
+          // 5 秒后二次确认：page 未被切换 + 按钮仍然存在（可能服务端已自愈、按钮消失）
+          if (page !== requestPage) {
+            console.log('[DEBUG] 5 秒等待期间 page 已切换，取消点击');
+            return null;
+          }
+          const retryBtnAgain = await detectRetryButton();
+          if (!retryBtnAgain) {
+            console.log('[DEBUG] 5 秒等待后重试按钮已消失，取消点击');
+            return null;
+          }
           let finishedResolve2;
           const finishedPromise2 = new Promise(resolve => { finishedResolve2 = resolve; });
           let fullContent2 = '';
@@ -1197,7 +1244,7 @@ async function main() {
             () => { finishedResolve2(); }
           );
           sseDeltaHandler = (chunk) => { try { parser2(chunk); } catch (e) {} };
-          await retryBtn.click();
+          await retryBtnAgain.click();
           await Promise.race([
             finishedPromise2,
             new Promise((_, reject) => setTimeout(() => reject(new Error('SSE timeout')), 5 * 60 * 1000))
@@ -1210,7 +1257,7 @@ async function main() {
           console.log('[DEBUG] 重试后仍未收到回复');
         } else {
           console.log('[DEBUG] 未检测到重试按钮，重新发送消息重试...');
-          await new Promise(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, 10000));
           return sendAndWait(text, cancelState, onDelta, retryCount + 1, fullText);
         }
       }
@@ -1761,6 +1808,7 @@ async function main() {
       let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
       // ★ 新会话完整版本（limitExceeded 重发时用）
       let fullPrompt = `【可用工具】\n${toolsText}${instruction}\n\n${fullPromptText}`;
+      await new Promise(r => setTimeout(r, 10000));
       let reply = await sendAndWait(prompt, cancelState, trackOnDelta, 0, fullPrompt);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
       console.log('[HTTP] 首次输出:', rawOutput.slice(0, 150));
@@ -1821,6 +1869,12 @@ async function main() {
             `【工具调用格式错误】\n` +
             `错误详情：\n${parseResult.error}\n\n` +
             `请重新输出完整的工具调用。`;
+
+          // ★ 发送纠正提示前先等 2 秒：
+          //   - 给页面一个渲染/输入框恢复的缓冲窗口，避免上一轮刚结束就立刻输入
+          //   - 用 setTimeout 而非 page.waitForTimeout：page 已关闭时后者会抛 Target closed
+          console.log(`[ToolCall] 等待 2 秒后发送纠正提示... (${correctionAttempts}/${MAX_CORRECTIONS})`);
+          await new Promise(r => setTimeout(r, 10000));
 
           reply = await sendAndWait(retryPrompt, cancelState, trackOnDelta);
           if (reply && reply.trim()) {
@@ -2187,6 +2241,7 @@ async function main() {
             if (data.stream === true && tools.length === 0) {
               const streamPrompt = `【可用工具】\n无\n\n${actualPromptText}`;
               const streamFullPrompt = `【可用工具】\n无\n\n${fullPromptText}`;
+              await new Promise(r => setTimeout(r, 10000));
               await sendAndWait(streamPrompt, cancelState, streamCtx.onDelta, 0, streamFullPrompt);
               // ★ 把流式缓冲区里最后的内容吐出来（尾部半截 '<...' 会被强制丢弃）
               try { streamCtx.flushStream(true); } catch (_) {}
@@ -2442,6 +2497,7 @@ async function main() {
 
     try {
       console.log('\x1b[33m⏳ 等待回复中...\x1b[0m');
+      await new Promise(r => setTimeout(r, 10000));
       const reply = await sendAndWait(text);
       process.stdout.write('\x1b[1A\x1b[K');
       if (reply) {
