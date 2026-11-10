@@ -482,87 +482,247 @@ async function main() {
   // 流式 SSE 解析器：处理增量 chunk，实时提取 RESPONSE（正文）增量；RESPONSE 空时用 THINK 兜底
   function createSSEParser(onResponseDelta, onFinished, onLimitExceeded) {
     let buffer = '';
-    let lastPath = '';
-    let lastOp = '';
-    let currentFragmentType = null; // 未知，由初始 response 对象或 APPEND 的 type 字段决定
+    let fragments = [];          // ★ 维护完整 fragments 数组
     let thinkContent = '';
     let responseContent = '';
+    let pendingContent = '';     // ★ fragments 尚未就绪时到达的增量，等类型确定后再归属
+    let lastPath = '';           // ★ 记录上一次的 p，用于处理省略 p 的连续增量
+    let lastOp = '';             // ★ 记录上一次的 o
+
+    // ★ 类型名兼容：DeepSeek 可能用 THINK / THINKING / REASONING 等变体，
+    //   固定大写后比对，避免平台改名导致静默丢弃或误判为正文
+    const isThinkType = (t) => {
+      if (typeof t !== 'string') return false;
+      const u = t.toUpperCase();
+      return u === 'THINK' || u === 'THINKING' || u === 'REASONING' || u === 'REASON';
+    };
+    const isResponseType = (t) => {
+      if (typeof t !== 'string') return false;
+      const u = t.toUpperCase();
+      return u === 'RESPONSE' || u === 'CONTENT' || u === 'ANSWER';
+    };
+
+    const getLastType = () => {
+      if (fragments.length === 0) return null;
+      const last = fragments[fragments.length - 1];
+      return (last && typeof last.type === 'string') ? last.type : null;
+    };
+
+    const emitResponse = (s) => {
+      if (!s) return;
+      responseContent += s;
+      try { onResponseDelta(s); } catch (_) {}
+    };
+
+    // ★ 把 pendingContent 按当前最后一个 fragment 的类型归属。
+    //   类型未知（fragments 空 / type 字段缺失 / 平台新增类型）时：默认按 THINK 处理（不输出正文），
+    //   避免协议变更时把 THINK 内容误当正文泄漏；可用 SSE_THINK_FALLBACK=1 强制当正文输出。
+    const flushPending = () => {
+      if (!pendingContent) return;
+      const type = getLastType();
+      if (isResponseType(type)) {
+        emitResponse(pendingContent);
+      } else if (isThinkType(type)) {
+        thinkContent += pendingContent;
+      } else if (process.env.SSE_THINK_FALLBACK === '1') {
+        if (process.env.DEBUG_SSE) {
+          console.log('[SSE诊断] flushPending 类型未知，SSE_THINK_FALLBACK=1 开启，按正文输出，type=' +
+            JSON.stringify(type) + ', 长度=' + pendingContent.length);
+        }
+        emitResponse(pendingContent);
+      } else {
+        if (process.env.DEBUG_SSE) {
+          console.log('[SSE诊断] flushPending 类型未知，按 THINK 处理（不输出正文），type=' +
+            JSON.stringify(type) + ', 长度=' + pendingContent.length +
+            '（若确为正文，请把类型名补进 isResponseType）');
+        }
+        thinkContent += pendingContent;
+      }
+      pendingContent = '';
+    };
+
+    const processFragment = (f) => {
+      if (!f || typeof f !== 'object') return;
+      const content = typeof f.content === 'string' ? f.content : '';
+      if (!content) return;
+      if (isResponseType(f.type)) {
+        emitResponse(content);
+      } else if (isThinkType(f.type)) {
+        thinkContent += content;
+      } else if (process.env.SSE_THINK_FALLBACK === '1') {
+        if (process.env.DEBUG_SSE) {
+          console.log('[SSE诊断] processFragment 未知类型，SSE_THINK_FALLBACK=1 开启，按正文输出，type=' +
+            JSON.stringify(f.type));
+        }
+        emitResponse(content);
+      } else {
+        if (process.env.DEBUG_SSE) {
+          console.log('[SSE诊断] processFragment 未知类型，按 THINK 处理（不输出正文），type=' +
+            JSON.stringify(f.type) + '（若确为正文，请把类型名补进 isResponseType）');
+        }
+        thinkContent += content;
+      }
+    };
+
+    // ★ 提取处理全量快照的公共逻辑
+    // 统一遍历所有 fragment，只要内容变长了就提取增量，避免既有元素增长被漏掉
+    const processFragmentsSnapshot = (newFrags) => {
+      for (let i = 0; i < newFrags.length; i++) {
+        const nf = newFrags[i];
+        if (!nf || typeof nf.content !== 'string') continue;
+        
+        const of = fragments[i];
+        const oldLen = (of && typeof of.content === 'string') ? of.content.length : 0;
+        if (nf.content.length <= oldLen) continue;
+        
+        const delta = nf.content.slice(oldLen);
+        if (!delta) continue;
+
+        if (isResponseType(nf.type)) {
+          emitResponse(delta);
+        } else if (isThinkType(nf.type)) {
+          thinkContent += delta;
+        } else if (process.env.SSE_THINK_FALLBACK === '1') {
+          if (process.env.DEBUG_SSE) {
+            console.log('[SSE诊断] 快照 fragment 增长但类型未知，SSE_THINK_FALLBACK=1 开启，按正文输出，type=' +
+              JSON.stringify(nf.type) + ', delta长度=' + delta.length);
+          }
+          emitResponse(delta);
+        } else {
+          if (process.env.DEBUG_SSE) {
+            console.log('[SSE诊断] 快照 fragment 增长但类型未知，按 THINK 处理（不输出正文），type=' +
+              JSON.stringify(nf.type) + ', delta长度=' + delta.length +
+              '（若确为正文，请把类型名补进 isResponseType）');
+          }
+          thinkContent += delta;
+        }
+      }
+      // ★ 使用 JSON 比较并直接覆盖，确保属性（如 content）被正确更新
+      fragments = newFrags.slice();
+    };
 
     return (chunk) => {
       buffer += chunk;
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // 保留最后一个不完整行
+      buffer = lines.pop();
 
       for (const line of lines) {
         if (!line.startsWith('data:')) continue;
         const dataStr = line.slice(5).trim();
         if (!dataStr.startsWith('{')) continue;
-        let d;
-        try { d = JSON.parse(dataStr); } catch (e) { continue; }
+        if (process.env.DEBUG_SSE_RAW) {
+          console.log('[SSE RAW]', dataStr.length > 800 ? dataStr.slice(0, 800) + '...' : dataStr);
+        }
+        let d; try { d = JSON.parse(dataStr); } catch (e) { continue; }
 
-        // 处理初始 response 对象：从 fragments 数组判断 fragment 类型（THINK 还是 RESPONSE）
+        // ① 初始化 response（快照可能重复发送，只处理新增 fragment，避免重复输出）
         if (d.v && d.v.response && Array.isArray(d.v.response.fragments)) {
-          for (const f of d.v.response.fragments) {
-            if (!f || typeof f.type !== 'string') continue;
-            currentFragmentType = f.type;
-            if (f.type === 'RESPONSE' && typeof f.content === 'string') {
-              responseContent += f.content;
-              onResponseDelta(f.content);
-            } else if (f.type === 'THINK' && typeof f.content === 'string') {
-              thinkContent += f.content;
-            }
-          }
+          processFragmentsSnapshot(d.v.response.fragments);
+          flushPending();
           continue;
         }
 
-        // 检测"对话长度上限"错误信号（hint 事件，finish_reason 为 context_length_exceeded）
+        // ② 长度上限信号
         if (d.type === 'error' && d.finish_reason === 'context_length_exceeded') {
           console.log('[SSE] 检测到对话长度上限错误（context_length_exceeded）');
           onLimitExceeded();
         }
 
+        // ③ ★ 处理当前消息的 p/o（兼容省略 p/o 的连续增量）
+        const curPath = d.p || '';
+        const curOp   = d.o || '';
+
         if (d.p) lastPath = d.p;
         if (d.o) lastOp = d.o;
 
-        // 追加新 fragment
-        if (lastPath === 'response/fragments' && lastOp === 'APPEND' && Array.isArray(d.v)) {
-          for (const f of d.v) {
-            if (f && f.type === 'RESPONSE') {
-              if (currentFragmentType !== 'RESPONSE') console.log('[SSE] 检测到 RESPONSE fragment');
-              currentFragmentType = 'RESPONSE';
-              if (typeof f.content === 'string') {
-                responseContent += f.content;
-                onResponseDelta(f.content);
-              }
-            } else if (f && f.type === 'THINK') {
-              currentFragmentType = 'THINK';
-              if (typeof f.content === 'string') thinkContent += f.content;
+        // DeepSeek 省流优化：连续同一个 p 的增量，后续只发 {"v":"xxx"}，无 p 无 o
+        let actualPath = curPath;
+        let actualOp = curOp;
+        if (!d.p && !d.o && typeof d.v === 'string') {
+          actualPath = lastPath;
+          // ★ 省略 p/o 的增量一定是对路径的追加。无论上一条 lastOp 是什么（比如 elapsed_secs 的 SET），
+          //   只要继承了路径，其操作必定是 APPEND 更新内容。
+          if (actualPath === 'response/fragments/-1/content' || actualPath === 'response/fragments/-1/thinking') {
+            actualOp = 'APPEND';
+          } else if (lastOp) {
+            actualOp = lastOp;
+          }
+        }
+
+        // ④ 处理 fragment 变化（兼容 APPEND 和全量快照）
+        if (actualPath === 'response/fragments') {
+          let arr = Array.isArray(d.v) ? d.v : (d.v && typeof d.v === 'object' ? [d.v] : []);
+          if (actualOp === 'APPEND') {
+            // 追加增量
+            for (const f of arr) { fragments.push(f); processFragment(f); }
+          } else {
+            // 全量快照（如 REPLACE 或未带 o 的 SET，日志中已证实存在无 o 的情况）
+            processFragmentsSnapshot(arr);
+          }
+          flushPending();
+          continue;
+        }
+
+        // ⑤ 最后一个 fragment 的 content 增量
+        if (actualPath === 'response/fragments/-1/content' && typeof d.v === 'string') {
+          if (actualOp && actualOp !== 'APPEND' && process.env.DEBUG_SSE) {
+            console.log('[SSE诊断] -1/content 的 o=' + actualOp + '（非 APPEND）');
+          }
+          const type = getLastType();
+          if (type === null) {
+            // ★ fragments 尚未就绪：缓存，绝不直接当正文输出（避免 THINK 被当正文）
+            pendingContent += d.v;
+            if (process.env.DEBUG_SSE) {
+              console.log('[SSE诊断] 增量到达但 fragments 为空，缓存 ' + d.v.length + ' 字符');
             }
+          } else if (isResponseType(type)) {
+            emitResponse(d.v);
+          } else if (isThinkType(type)) {
+            thinkContent += d.v;
+          } else if (process.env.SSE_THINK_FALLBACK === '1') {
+            if (process.env.DEBUG_SSE) {
+              console.log('[SSE诊断] 未知 fragment 类型，SSE_THINK_FALLBACK=1 开启，按正文输出，type=' +
+                JSON.stringify(type) + ', delta长度=' + d.v.length);
+            }
+            emitResponse(d.v);
+          } else {
+            if (process.env.DEBUG_SSE) {
+              console.log('[SSE诊断] 未知 fragment 类型，按 THINK 处理（不输出正文），type=' +
+                JSON.stringify(type) + ', delta长度=' + d.v.length +
+                '（若确为正文，请把类型名补进 isResponseType）');
+            }
+            thinkContent += d.v;
           }
           continue;
         }
 
-        // 流式累积 content（-1 指向当前 fragment）
-        if (lastPath === 'response/fragments/-1/content') {
-          if (typeof d.v === 'string') {
-            if (currentFragmentType === 'THINK') {
-              thinkContent += d.v;
-            } else {
-              // RESPONSE 或未知类型：默认按正文处理，避免误判为思考
-              responseContent += d.v;
-              onResponseDelta(d.v);
-            }
-          }
-          continue;
-        }
-
-        // 完成信号
-        if (d.p === 'response/status' && d.v === 'FINISHED') {
+        // ⑥ FINISHED
+        if (actualPath === 'response/status' && d.v === 'FINISHED') {
           console.log('[SSE] 检测到 FINISHED 信号');
+          // ★ FINISHED 前若仍有 pendingContent，按当前类型归属一次
+          if (pendingContent) {
+            if (process.env.DEBUG_SSE) {
+              console.log('[SSE诊断] FINISHED 前仍有 pendingContent ' +
+                pendingContent.length + ' 字符，类型=' + JSON.stringify(getLastType()));
+            }
+            flushPending();
+          }
+          // ★ 默认不把 THINK 当正文输出：模型只思考不回答时返回空正文，
+          //   由上层 sendAndWait 走"正文为空"分支重试 / 系统提示兜底，避免 THINK 污染正文。
+          //   如确需保留旧行为（THINK 兜底进正文），设环境变量 SSE_THINK_FALLBACK=1 开启。
           if (!responseContent && thinkContent) {
-            console.log('[SSE] 模型只输出了思考（THINK），正文（RESPONSE）为空，THINK长度:', thinkContent.length);
+            if (process.env.SSE_THINK_FALLBACK === '1') {
+              console.log('[SSE] 只收到 THINK，正文为空，THINK 长度:', thinkContent.length,
+                '，SSE_THINK_FALLBACK=1 已开启，用 THINK 兜底输出');
+              try { onResponseDelta(thinkContent); } catch (_) {}
+              responseContent += thinkContent;
+            } else {
+              console.log('[SSE] 只收到 THINK，正文为空，THINK 长度:', thinkContent.length,
+                '，默认不输出 THINK（如需兜底请设 SSE_THINK_FALLBACK=1）');
+            }
           }
           onFinished();
+          continue;
         }
       }
     };
@@ -840,116 +1000,124 @@ async function main() {
       return false;
     };
 
-    const parser = createSSEParser(
-            (delta) => {
-        fullContent += delta;
+    // ★ 把 delta 处理逻辑提为具名函数，方便重试时用相同逻辑重建 parser
+    const onResponseDeltaImpl = (delta) => {
+      fullContent += delta;
 
-        // 逐段扫描新增部分，输出工具调用块之外的文本，跳过块内内容
-        let out = '';
-        let i = outputLen;
-        while (i < fullContent.length) {
-          const rest = fullContent.slice(i);
+      // 逐段扫描新增部分，输出工具调用块之外的文本，跳过块内内容
+      let out = '';
+      let i = outputLen;
+      while (i < fullContent.length) {
+        const rest = fullContent.slice(i);
 
-          // ★ 先吃掉任何残留的闭合标签（无论是否在块内）
-          const strayParamClose = rest.match(RE_PARAM_CLOSE);
-          if (strayParamClose) {
-            i += strayParamClose[0].length;
-            // 孤儿 parameter 块：遇到 </parameter> 即退出
-            if (inToolBlock && toolBlockEnd === 'parameter') { inToolBlock = false; toolBlockEnd = ''; }
-            continue;
-          }
-          const strayCallsClose = rest.match(RE_CALLS_CLOSE);
-          if (strayCallsClose) {
-            i += strayCallsClose[0].length;
-            if (inToolBlock && toolBlockEnd === 'calls') { inToolBlock = false; toolBlockEnd = ''; }
-            continue;
-          }
-          const strayInvokeClose = rest.match(RE_INVOKE_CLOSE);
-          if (strayInvokeClose) {
-            i += strayInvokeClose[0].length;
-            if (inToolBlock && toolBlockEnd === 'invoke') { inToolBlock = false; toolBlockEnd = ''; }
-            continue;
-          }
-
-          if (!inToolBlock) {
-            // 进入 <... calls>（含 DSML 或纯竖线噪声）
-            const callsOpen = rest.match(RE_CALLS_OPEN);
-            if (callsOpen) {
-              inToolBlock = true;
-              toolBlockEnd = 'calls';
-              i += callsOpen[0].length;
-              continue;
-            }
-            // 进入 <... invoke>（无 calls 包裹的异常输出）
-            const invokeOpen = rest.match(RE_INVOKE_OPEN);
-            if (invokeOpen) {
-              inToolBlock = true;
-              toolBlockEnd = 'invoke';
-              i += invokeOpen[0].length;
-              continue;
-            }
-            // 孤儿 <... parameter>（模型漏了 invoke 包裹）——进入吞掉模式
-            const paramOpen = rest.match(RE_PARAM_OPEN);
-            if (paramOpen) {
-              inToolBlock = true;
-              toolBlockEnd = 'parameter';
-              i += paramOpen[0].length;
-              continue;
-            }
-
-            // 跨增量缓冲（含停滞检测）
-            if (isToolTagPrefix(rest)) {
-              if (bufferingSince === 0) {
-                bufferingSince = Date.now();
-              } else if (Date.now() - bufferingSince > BUFFER_STALL_MS) {
-                console.log('[SSE] 标签缓冲停滞超过 ' + BUFFER_STALL_MS + 'ms，放弃缓冲');
-                out += fullContent[i];
-                i++;
-                bufferingSince = 0;
-                continue;
-              }
-              break;
-            } else {
-              bufferingSince = 0;
-            }
-
-            out += fullContent[i];
-            i++;
-          } else {
-            // 块内：跟踪嵌套开标签（parameter 计数）
-            const paramOpen = rest.match(RE_PARAM_OPEN);
-            if (paramOpen) {
-              i += paramOpen[0].length;
-              continue;
-            }
-            // 闭合标签（calls/invoke/parameter）已在循环开头由 stray*Close 分支统一处理，
-            if (isToolTagPrefix(rest)) {
-              if (bufferingSince === 0) {
-                bufferingSince = Date.now();
-              } else if (Date.now() - bufferingSince > BUFFER_STALL_MS) {
-                console.log('[SSE] 块内标签缓冲停滞超过 ' + BUFFER_STALL_MS + 'ms，放弃缓冲');
-                i++;
-                bufferingSince = 0;
-                continue;
-              }
-              break;
-            } else {
-              bufferingSince = 0;
-            }
-            // 块内内容一律跳过
-            i++;
-          }
+        // ★ 先吃掉任何残留的闭合标签（无论是否在块内）
+        const strayParamClose = rest.match(RE_PARAM_CLOSE);
+        if (strayParamClose) {
+          i += strayParamClose[0].length;
+          // 孤儿 parameter 块：遇到 </parameter> 即退出
+          if (inToolBlock && toolBlockEnd === 'parameter') { inToolBlock = false; toolBlockEnd = ''; }
+          continue;
         }
-        outputLen = i;
+        const strayCallsClose = rest.match(RE_CALLS_CLOSE);
+        if (strayCallsClose) {
+          i += strayCallsClose[0].length;
+          if (inToolBlock && toolBlockEnd === 'calls') { inToolBlock = false; toolBlockEnd = ''; }
+          continue;
+        }
+        const strayInvokeClose = rest.match(RE_INVOKE_CLOSE);
+        if (strayInvokeClose) {
+          i += strayInvokeClose[0].length;
+          if (inToolBlock && toolBlockEnd === 'invoke') { inToolBlock = false; toolBlockEnd = ''; }
+          continue;
+        }
 
-        if (out && onDelta) { try { onDelta(out); } catch (e) {} }
-      },
+        if (!inToolBlock) {
+          // 进入 <... calls>（含 DSML 或纯竖线噪声）
+          const callsOpen = rest.match(RE_CALLS_OPEN);
+          if (callsOpen) {
+            inToolBlock = true;
+            toolBlockEnd = 'calls';
+            i += callsOpen[0].length;
+            continue;
+          }
+          // 进入 <... invoke>（无 calls 包裹的异常输出）
+          const invokeOpen = rest.match(RE_INVOKE_OPEN);
+          if (invokeOpen) {
+            inToolBlock = true;
+            toolBlockEnd = 'invoke';
+            i += invokeOpen[0].length;
+            continue;
+          }
+          // 孤儿 <... parameter>（模型漏了 invoke 包裹）——进入吞掉模式
+          const paramOpen = rest.match(RE_PARAM_OPEN);
+          if (paramOpen) {
+            inToolBlock = true;
+            toolBlockEnd = 'parameter';
+            i += paramOpen[0].length;
+            continue;
+          }
+
+          // 跨增量缓冲（含停滞检测）
+          if (isToolTagPrefix(rest)) {
+            if (bufferingSince === 0) {
+              bufferingSince = Date.now();
+            } else if (Date.now() - bufferingSince > BUFFER_STALL_MS) {
+              console.log('[SSE] 标签缓冲停滞超过 ' + BUFFER_STALL_MS + 'ms，放弃缓冲');
+              out += fullContent[i];
+              i++;
+              bufferingSince = 0;
+              continue;
+            }
+            break;
+          } else {
+            bufferingSince = 0;
+          }
+
+          out += fullContent[i];
+          i++;
+        } else {
+          // 块内：跟踪嵌套开标签（parameter 计数）
+          const paramOpen = rest.match(RE_PARAM_OPEN);
+          if (paramOpen) {
+            i += paramOpen[0].length;
+            continue;
+          }
+          // 闭合标签（calls/invoke/parameter）已在循环开头由 stray*Close 分支统一处理，
+          if (isToolTagPrefix(rest)) {
+            if (bufferingSince === 0) {
+              bufferingSince = Date.now();
+            } else if (Date.now() - bufferingSince > BUFFER_STALL_MS) {
+              console.log('[SSE] 块内标签缓冲停滞超过 ' + BUFFER_STALL_MS + 'ms，放弃缓冲');
+              i++;
+              bufferingSince = 0;
+              continue;
+            }
+            break;
+          } else {
+            bufferingSince = 0;
+          }
+          // 块内内容一律跳过
+          i++;
+        }
+      }
+      outputLen = i;
+
+      if (out && onDelta) { try { onDelta(out); } catch (e) {} }
+    };
+
+    // ★ buildParser 供主流程与 retryCheckTimer 共用；重试时必须重建，
+    //   否则 fragments / thinkContent / responseContent / buffer 残留会导致
+    //   重试后新回复的 THINK 被当正文（或正文被当 THINK）输出
+    const buildParser = () => createSSEParser(
+      onResponseDeltaImpl,
       () => { finishedResolve(); },
       () => {
         limitExceeded = true;
         finishedResolve(); // 已满时无 FINISHED 信号，主动触发让等待提前结束
       }
     );
+
+    let parser = buildParser();
     sseDeltaHandler = (chunk) => {
       sseChunkCount++;
       sseRawBytes += chunk.length;
@@ -1037,7 +1205,10 @@ async function main() {
     if (isOverLimit) {
       console.log(`\x1b[31m[ERROR] 检测到上下文超限: ${isOverLimit}\x1b[0m`);
       sseDeltaHandler = null;
-      return null;
+      // ★ 设置超限标志并主动结束等待，让代码走到后面统一的 limitExceeded 分支，
+      //   自动开新对话并用完整历史重发，避免程序卡在"每次返回系统提示"的死循环
+      limitExceeded = true;
+      finishedResolve();
     }
 
     console.log('\x1b[35m[DEBUG] 等待 SSE 回复...\x1b[0m');
@@ -1086,6 +1257,9 @@ async function main() {
         //   否则上一次尝试累积的标签数会误触发中止/污染新回复
         dsmlFloodCount = 0;
         bufferingSince = 0;
+        // ★ 必须重建 parser：清空 fragments / thinkContent / responseContent / buffer，
+        //   否则上一轮残留的 fragment 类型会让新一轮的 THINK 被当正文输出
+        parser = buildParser();
       } catch (e) {
         // 忽略
       } finally {
@@ -1241,7 +1415,10 @@ async function main() {
             () => { finishedResolve2(); },
             // ★ 重试也需监听超限信号：否则 onLimitExceeded 为 undefined 时抛错被吞，
             //   finishedPromise2 永远 pending，直到 5 分钟超时。
-            () => { finishedResolve2(); }
+            () => { 
+              limitExceeded = true; // ★ 补齐：重试时也要把超限信号传回主流程
+              finishedResolve2(); 
+            }
           );
           sseDeltaHandler = (chunk) => { try { parser2(chunk); } catch (e) {} };
           await retryBtnAgain.click();
@@ -1805,8 +1982,23 @@ async function main() {
         try { onDelta(chunk); } catch (e) {}
       } : null;
 
-      let prompt = `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
-      // ★ 新会话完整版本（limitExceeded 重发时用）
+      // ★ 判断是否为「纯工具增量」请求：
+      //   特征：以【工具执行结果开头，且以 buildPromptText 在纯工具回调场景追加的结尾引导语结尾。
+      //   - 用 endsWith 而非 includes 判断，避免工具返回的内容里恰好包含
+      //     【系统提示】/【用户消息】字面量导致误判（例如 read 工具返回了含这些字样的文件）。
+      //   - 结尾引导语只由 buildPromptText 场景 B（hasTool && !hasUser）追加，不会出现在工具内容里。
+      //   - 纯工具增量 → 直接发增量，不带工具列表（省 Token）
+      //   - 其他情况（首轮 / 重建 / 有新的 user 追问 / 混合 [tool, user]）→ 带上完整工具列表，
+      //     防止模型忘记有哪些工具、防止新指令无法调用工具。
+      const isPureToolIncrement =
+        promptText.startsWith('【工具执行结果') &&
+        promptText.endsWith('请基于上述工具执行结果继续回答。\n');
+
+      let prompt = isPureToolIncrement
+        ? promptText
+        : `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
+
+      // ★ 新会话完整版本（limitExceeded 重发时用），必须始终携带完整的工具说明
       let fullPrompt = `【可用工具】\n${toolsText}${instruction}\n\n${fullPromptText}`;
       await new Promise(r => setTimeout(r, 10000));
       let reply = await sendAndWait(prompt, cancelState, trackOnDelta, 0, fullPrompt);
@@ -1870,10 +2062,10 @@ async function main() {
             `错误详情：\n${parseResult.error}\n\n` +
             `请重新输出完整的工具调用。`;
 
-          // ★ 发送纠正提示前先等 2 秒：
+          // ★ 发送纠正提示前先等 10 秒：
           //   - 给页面一个渲染/输入框恢复的缓冲窗口，避免上一轮刚结束就立刻输入
           //   - 用 setTimeout 而非 page.waitForTimeout：page 已关闭时后者会抛 Target closed
-          console.log(`[ToolCall] 等待 2 秒后发送纠正提示... (${correctionAttempts}/${MAX_CORRECTIONS})`);
+          console.log(`[ToolCall] 等待 10 秒后发送纠正提示... (${correctionAttempts}/${MAX_CORRECTIONS})`);
           await new Promise(r => setTimeout(r, 10000));
 
           reply = await sendAndWait(retryPrompt, cancelState, trackOnDelta);
@@ -1978,76 +2170,75 @@ async function main() {
             //     依赖 DeepSeek 会话自身的服务端上下文，避免"prompt 历史 + 服务端上下文"双重累积导致超限。
             //   - fullPromptText（新会话用）：完整历史，切换新对话后重发时使用。
             //     客户端会自己压缩历史，新会话本身没超限过，所以直接用客户端给的完整 messages。
-                        function buildPromptText(includeFullHistory) {
+            function buildPromptText(includeFullHistory) {
               let text = "";
 
               if (!includeFullHistory) {
-                // ★ 旧会话：system + 最后一条 user + 最后一次工具调用的结果
-                //
-                //   核心原理：
-                //   - 第 1 轮发 system + user → 服务端上下文累积这两条
-                //   - 第 2 轮发 system + user + tool1 结果 → tool1 结果进服务端上下文
-                //   - 第 3 轮发 system + user + tool2 结果 → tool2 结果进服务端上下文
-                //   - 因此每轮只需发"最新一条 tool 结果"，历史 tool 结果已在服务端上下文里
-                //   - 好处：大文件 tool 结果不用截断（prompt 里只有 1 批），不双重累积，不超限
-                //
-                //   实现细节：
-                //   - system 每次发（防止服务端裁剪丢失）
-                //   - user 只发最后一条（历史 user 在服务端上下文里）
-                //   - tool 消息发"最后一条 assistant 之后的所有 tool"——
-                //     单工具调用 = 最后一条；并行多工具调用 = 全部（都对应同一个 tool_calls）
-                //   - 纯聊天（无 tool 消息）：只发 system + 最后 user，行为不变
-
-                for (const msg of messages) {
-                  if (msg.role === 'system') {
-                    const rawContent = extractTextContent(msg.content);
-                    text += `【系统提示】\n${rawContent}`;
-                  }
-                }
-
-                if (userMsg) {
-                  text += `【用户消息】\n${userMsg}`;
-                }
-
-                // ★ 找到最后一条 user 的索引
-                let lastUserIdx = -1;
+                // 1. 找到最后一条 assistant 的索引（代表上一次模型的输出/工具调用指令）
+                let lastAssistantIdx = -1;
                 for (let i = messages.length - 1; i >= 0; i--) {
-                  if (messages[i].role === 'user') {
-                    lastUserIdx = i;
+                  if (messages[i].role === 'assistant') {
+                    lastAssistantIdx = i;
                     break;
                   }
                 }
 
-                // ★ 只发「最后一批连续 tool 消息」：
-                //   - agent 多轮循环里，每轮都会新增一批 tool 消息
-                //   - 之前的批次已经在上一次请求发过、进入了服务端上下文
-                //   - 这一次只发最新一批（最后一段连续的 tool 消息）
-                //   如果从 lastUserIdx 之后发「所有 tool」，会重复发送历史 tool 结果
-                //   并行多工具调用（一次 assistant 后跟 3 条 tool）会被当作一批全部发送
-                let toolGroupStart = -1;
-                let toolGroupEnd = -1;
-                for (let i = messages.length - 1; i > lastUserIdx; i--) {
-                  if (messages[i].role === 'tool') {
-                    if (toolGroupEnd === -1) toolGroupEnd = i;
-                    toolGroupStart = i;
-                  } else if (toolGroupEnd !== -1) {
-                    // 遇到非 tool 消息，说明这一批 tool 结束
-                    break;
-                  }
+                // 2. 从最后一条 assistant 之后提取所有的增量内容（可能有 tool 结果，也可能有新的 user 消息）
+                const incrementalMsgs = [];
+                for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
+                  incrementalMsgs.push(messages[i]);
                 }
 
-                if (toolGroupStart !== -1 && toolGroupEnd !== -1) {
-                  for (let i = toolGroupStart; i <= toolGroupEnd; i++) {
-                    const content = extractTextContent(messages[i].content);
-                    // ★ 不截断：只有最新一批 tool 结果，完整发送让模型能看到大文件全文
-                    text += `【工具信息】\n${content}`;
+                // 3. 判断是否有实际的增量输入
+                const hasTool = incrementalMsgs.some(m => m.role === 'tool');
+                const hasUser = incrementalMsgs.some(m => m.role === 'user');
+
+                if (lastAssistantIdx === -1) {
+                  // 场景 A：服务端无历史（第一轮对话）。直接发 system + user，保持纯净
+                  for (const msg of messages) {
+                    if (msg.role === 'system') {
+                      const rawContent = extractTextContent(msg.content);
+                      text += `【系统提示】\n${rawContent}`;
+                    }
+                  }
+                  if (userMsg) {
+                    text += `【用户消息】\n${userMsg}`;
+                  }
+                } else if (hasTool || hasUser) {
+                  // 场景 B：多轮对话包含工具回调或新提示。只发增量部分
+                  for (const msg of incrementalMsgs) {
+                    if (msg.role === 'tool') {
+                      const content = extractTextContent(msg.content);
+                      const toolName = msg.name ? `[${msg.name}]` : '';
+                      text += `【工具执行结果 ${toolName}】\n${content}\n\n`;
+                    } else if (msg.role === 'user') {
+                      const content = extractTextContent(msg.content);
+                      text += `【用户消息】\n${content}\n\n`;
+                    }
+                  }
+                  // ★ 只有"纯工具回调"（有 tool 但没有新 user）才标记为增量，节省 Token。
+                  //   如果同时有新的用户消息，用户很可能想基于结果继续使用工具（比如换个参数再试），
+                  //   此时不加提示语，让 getFinalReplyWithTools 带上完整的工具列表，避免模型"忘记"工具有哪些。
+                  if (hasTool && !hasUser) {
+                    text += `请基于上述工具执行结果继续回答。\n`;
+                  }
+                } else {
+                  // 场景 C：兜底
+                  for (const msg of messages) {
+                    if (msg.role === 'system') {
+                      const rawContent = extractTextContent(msg.content);
+                      text += `【系统提示】\n${rawContent}`;
+                    }
+                  }
+                  if (userMsg) {
+                    text += `【用户消息】\n${userMsg}`;
                   }
                 }
 
                 return text;
               }
 
-              // ★ 新会话：完整历史（客户端已压缩，直接用完整 messages 让模型完全复现上下文）
+              // ★ 新会话逻辑（切换新聊天窗口 / 超限）：全部发送所有历史
               for (const msg of messages) {
                 let rawContent = extractTextContent(msg.content);
                 if (msg.role === 'assistant') {
@@ -2063,7 +2254,8 @@ async function main() {
                 } else if (msg.role === 'assistant') {
                   text += `【模型回复】\n${rawContent}`;
                 } else if (msg.role === 'tool') {
-                  text += `【工具信息】\n${rawContent}`;
+                  const toolName = msg.name ? `[${msg.name}]` : '';
+                  text += `【工具信息 ${toolName}】\n${rawContent}`;
                 }
               }
               return text;
@@ -2239,7 +2431,16 @@ async function main() {
 
             // 真正流式：无工具 + 流式请求时，正文边接收边返回
             if (data.stream === true && tools.length === 0) {
-              const streamPrompt = `【可用工具】\n无\n\n${actualPromptText}`;
+              // ★ 与 getFinalReplyWithTools 中保持一致的「纯工具增量」判断：
+              //   用 endsWith 替代 includes，避免工具返回内容里恰好包含
+              //   【系统提示】/【用户消息】字面量导致误判。
+              const isPureToolIncrementStream =
+                actualPromptText.startsWith('【工具执行结果') &&
+                actualPromptText.endsWith('请基于上述工具执行结果继续回答。\n');
+
+              const streamPrompt = isPureToolIncrementStream
+                ? actualPromptText
+                : `【可用工具】\n无\n\n${actualPromptText}`;
               const streamFullPrompt = `【可用工具】\n无\n\n${fullPromptText}`;
               await new Promise(r => setTimeout(r, 10000));
               await sendAndWait(streamPrompt, cancelState, streamCtx.onDelta, 0, streamFullPrompt);
