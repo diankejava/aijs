@@ -1972,7 +1972,7 @@ async function main() {
         .trim();
     }
 
-    async function getFinalReplyWithTools(promptText, fullPromptText, toolsText, instruction, toolNames, toolSchemas, cancelState, onDelta = null) {
+    async function getFinalReplyWithTools(promptText, fullPromptText, toolNames, toolSchemas, cancelState, onDelta = null) {
       // ★ 追踪 onDelta 是否已经发出过任何内容
       //   如果从未发出过，最终由调用方（task()）把 rawOutput 一次性补发出去，
       //   避免客户端收到"只有 finish 没有 content"的空响应。
@@ -1982,24 +1982,13 @@ async function main() {
         try { onDelta(chunk); } catch (e) {}
       } : null;
 
-      // ★ 判断是否为「纯工具增量」请求：
-      //   特征：以【工具执行结果开头，且以 buildPromptText 在纯工具回调场景追加的结尾引导语结尾。
-      //   - 用 endsWith 而非 includes 判断，避免工具返回的内容里恰好包含
-      //     【系统提示】/【用户消息】字面量导致误判（例如 read 工具返回了含这些字样的文件）。
-      //   - 结尾引导语只由 buildPromptText 场景 B（hasTool && !hasUser）追加，不会出现在工具内容里。
-      //   - 纯工具增量 → 直接发增量，不带工具列表（省 Token）
-      //   - 其他情况（首轮 / 重建 / 有新的 user 追问 / 混合 [tool, user]）→ 带上完整工具列表，
-      //     防止模型忘记有哪些工具、防止新指令无法调用工具。
-      const isPureToolIncrement =
-        promptText.startsWith('【工具执行结果') &&
-        promptText.endsWith('请基于上述工具执行结果继续回答。\n');
-
-      let prompt = isPureToolIncrement
-        ? promptText
-        : `【可用工具】\n${toolsText}${instruction}\n\n${promptText}`;
-
-      // ★ 新会话完整版本（limitExceeded 重发时用），必须始终携带完整的工具说明
-      let fullPrompt = `【可用工具】\n${toolsText}${instruction}\n\n${fullPromptText}`;
+      // ★ promptText / fullPromptText 已由 buildPromptText 按需拼接好工具列表：
+      //   - 用户消息里提及"工具"字眼 → 已带【可用工具】+ 工具说明
+      //   - 纯工具回调 / 用户未提及"工具" → 只发用户消息或工具结果，不带工具列表
+      //   所以这里直接使用，不再二次拼接。
+      //   （原 toolsText / instruction 参数已上移到 buildPromptText，此处不再接收）
+      let prompt = promptText;
+      let fullPrompt = fullPromptText;
       await new Promise(r => setTimeout(r, 10000));
       let reply = await sendAndWait(prompt, cancelState, trackOnDelta, 0, fullPrompt);
       let rawOutput = (reply && reply.trim()) || '【系统提示】DeepSeek 未返回有效回复。';
@@ -2165,121 +2154,7 @@ async function main() {
 
             const historyNoise = /^(复制|下载|运行|调试|代码)$/;
 
-            // ★ 构建两个版本的 prompt：
-            //   - promptText（默认，旧会话用）：只发 system + 当前 user，不发任何历史。
-            //     依赖 DeepSeek 会话自身的服务端上下文，避免"prompt 历史 + 服务端上下文"双重累积导致超限。
-            //   - fullPromptText（新会话用）：完整历史，切换新对话后重发时使用。
-            //     客户端会自己压缩历史，新会话本身没超限过，所以直接用客户端给的完整 messages。
-            function buildPromptText(includeFullHistory) {
-              let text = "";
-
-              if (!includeFullHistory) {
-                // 1. 找到最后一条 assistant 的索引（代表上一次模型的输出/工具调用指令）
-                let lastAssistantIdx = -1;
-                for (let i = messages.length - 1; i >= 0; i--) {
-                  if (messages[i].role === 'assistant') {
-                    lastAssistantIdx = i;
-                    break;
-                  }
-                }
-
-                // 2. 从最后一条 assistant 之后提取所有的增量内容（可能有 tool 结果，也可能有新的 user 消息）
-                const incrementalMsgs = [];
-                for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
-                  incrementalMsgs.push(messages[i]);
-                }
-
-                // 3. 判断是否有实际的增量输入
-                const hasTool = incrementalMsgs.some(m => m.role === 'tool');
-                const hasUser = incrementalMsgs.some(m => m.role === 'user');
-
-                if (lastAssistantIdx === -1) {
-                  // 场景 A：服务端无历史（第一轮对话）。直接发 system + user，保持纯净
-                  for (const msg of messages) {
-                    if (msg.role === 'system') {
-                      const rawContent = extractTextContent(msg.content);
-                      text += `【系统提示】\n${rawContent}`;
-                    }
-                  }
-                  if (userMsg) {
-                    text += `【用户消息】\n${userMsg}`;
-                  }
-                } else if (hasTool || hasUser) {
-                  // 场景 B：多轮对话包含工具回调或新提示。只发增量部分
-                  for (const msg of incrementalMsgs) {
-                    if (msg.role === 'tool') {
-                      const content = extractTextContent(msg.content);
-                      const toolName = msg.name ? `[${msg.name}]` : '';
-                      text += `【工具执行结果 ${toolName}】\n${content}\n\n`;
-                    } else if (msg.role === 'user') {
-                      const content = extractTextContent(msg.content);
-                      text += `【用户消息】\n${content}\n\n`;
-                    }
-                  }
-                  // ★ 只有"纯工具回调"（有 tool 但没有新 user）才标记为增量，节省 Token。
-                  //   如果同时有新的用户消息，用户很可能想基于结果继续使用工具（比如换个参数再试），
-                  //   此时不加提示语，让 getFinalReplyWithTools 带上完整的工具列表，避免模型"忘记"工具有哪些。
-                  if (hasTool && !hasUser) {
-                    text += `请基于上述工具执行结果继续回答。\n`;
-                  }
-                } else {
-                  // 场景 C：兜底
-                  for (const msg of messages) {
-                    if (msg.role === 'system') {
-                      const rawContent = extractTextContent(msg.content);
-                      text += `【系统提示】\n${rawContent}`;
-                    }
-                  }
-                  if (userMsg) {
-                    text += `【用户消息】\n${userMsg}`;
-                  }
-                }
-
-                return text;
-              }
-
-              // ★ 新会话逻辑（切换新聊天窗口 / 超限）：全部发送所有历史
-              for (const msg of messages) {
-                let rawContent = extractTextContent(msg.content);
-                if (msg.role === 'assistant') {
-                  rawContent = rawContent
-                    .split('\n')
-                    .filter(line => !historyNoise.test(line.trim()))
-                    .join('\n');
-                }
-                if (msg.role === 'system') {
-                  text += `【系统提示】\n${rawContent}`;
-                } else if (msg.role === 'user') {
-                  text += `【用户消息】\n${rawContent}`;
-                } else if (msg.role === 'assistant') {
-                  text += `【模型回复】\n${rawContent}`;
-                } else if (msg.role === 'tool') {
-                  const toolName = msg.name ? `[${msg.name}]` : '';
-                  text += `【工具信息 ${toolName}】\n${rawContent}`;
-                }
-              }
-              return text;
-            }
-
-            const promptText = buildPromptText(false);   // 旧会话用：极简
-            const fullPromptText = buildPromptText(true); // 新会话用：完整历史
-
-            // ★ 程序启动后第一次请求：服务端上下文为空，必须用完整历史建立上下文
-            //   之后依赖服务端上下文，用 promptText（system + 最新 user）
-            let actualPromptText = promptText;
-            if (isFirstRequestAfterStart) {
-              isFirstRequestAfterStart = false;
-              // 只有 messages 里有实质历史（> system + 1 user）时才需要切换
-              // 新任务场景（只有 system + 1 user）两者等价，无需特别处理
-              if (messages.length > 2) {
-                console.log('[启动] 首次请求检测到历史消息，使用完整历史 prompt 建立上下文');
-                actualPromptText = fullPromptText;
-              }
-            }
-            console.log(`[HTTP] prompt 模式：${actualPromptText === fullPromptText ? '完整历史' : '旧会话极简'} ${actualPromptText.length} 字符 / 完整版 ${fullPromptText.length} 字符`);
-
-            console.log('[HTTP] 收到消息:', userMsg.slice(0, 50), '...');
-
+            // ★ toolsText / toolCallInstructions 需要提前定义，供 buildPromptText 内部按需拼接
             const toolsText = tools.length > 0
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
               : '无';
@@ -2303,6 +2178,133 @@ async function main() {
     `    <｜｜DSML｜｜ parameter name="path">E:\\...\n` +
     `  （每个参数的开标签、值、闭合标签必须各自成对，不得跨参数合并）\n`
   : '';
+
+            // ★ 新逻辑：
+            //   1) 只有"最后一条 user 消息"包含"工具"字眼（中文"工具"或英文 tool/tools），
+            //      才在 prompt 开头拼接【可用工具】+ 工具说明；
+            //   2) 纯工具回调（hasTool && !hasUser）绝不带工具列表、绝不带任何引导语，
+            //      只发【工具执行结果 ...】；
+            //   3) 其他情况（首轮/兜底/完整历史），也按"用户是否提及工具"决定。
+            function buildPromptText(includeFullHistory, toolsText, instruction) {
+              let text = "";
+              let needTools = false;
+              // ★ 判断用户消息是否提及"工具"字眼（不区分大小写；匹配"工具"/"tool"/"tools"）
+              const userMentionsTools = /工具|tools?/i.test(userMsg);
+
+              if (!includeFullHistory) {
+                // 1. 找到最后一条 assistant 的索引（代表上一次模型的输出/工具调用指令）
+                let lastAssistantIdx = -1;
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (messages[i].role === 'assistant') {
+                    lastAssistantIdx = i;
+                    break;
+                  }
+                }
+
+                // 2. 从最后一条 assistant 之后提取所有的增量内容
+                const incrementalMsgs = [];
+                for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
+                  incrementalMsgs.push(messages[i]);
+                }
+
+                // 3. 判断是否有实际的增量输入
+                const hasTool = incrementalMsgs.some(m => m.role === 'tool');
+                const hasUser = incrementalMsgs.some(m => m.role === 'user');
+
+                if (lastAssistantIdx === -1) {
+                  // 场景 A：服务端无历史（第一轮对话）
+                  for (const msg of messages) {
+                    if (msg.role === 'system') {
+                      const rawContent = extractTextContent(msg.content);
+                      text += `【系统提示】\n${rawContent}`;
+                    }
+                  }
+                  if (userMsg) {
+                    text += `【用户消息】\n${userMsg}`;
+                  }
+                  needTools = userMentionsTools;
+                } else if (hasTool || hasUser) {
+                  // 场景 B：多轮对话包含工具回调或新提示
+                  for (const msg of incrementalMsgs) {
+                    if (msg.role === 'tool') {
+                      const content = extractTextContent(msg.content);
+                      const toolName = msg.name ? `[${msg.name}]` : '';
+                      text += `【工具执行结果 ${toolName}】\n${content}\n\n`;
+                    } else if (msg.role === 'user') {
+                      const content = extractTextContent(msg.content);
+                      text += `【用户消息】\n${content}\n\n`;
+                    }
+                  }
+                  if (hasTool && !hasUser) {
+                    // ★ 纯工具回调：只发工具结果，不带任何前缀、引导语、工具列表
+                    needTools = false;
+                  } else {
+                    // ★ 有新 user 消息：用户提及"工具"才带工具列表
+                    needTools = userMentionsTools;
+                  }
+                } else {
+                  // 场景 C：兜底
+                  for (const msg of messages) {
+                    if (msg.role === 'system') {
+                      const rawContent = extractTextContent(msg.content);
+                      text += `【系统提示】\n${rawContent}`;
+                    }
+                  }
+                  if (userMsg) {
+                    text += `【用户消息】\n${userMsg}`;
+                  }
+                  needTools = userMentionsTools;
+                }
+              } else {
+                // ★ 新会话完整历史：拼接所有消息
+                for (const msg of messages) {
+                  let rawContent = extractTextContent(msg.content);
+                  if (msg.role === 'assistant') {
+                    rawContent = rawContent
+                      .split('\n')
+                      .filter(line => !historyNoise.test(line.trim()))
+                      .join('\n');
+                  }
+                  if (msg.role === 'system') {
+                    text += `【系统提示】\n${rawContent}`;
+                  } else if (msg.role === 'user') {
+                    text += `【用户消息】\n${rawContent}`;
+                  } else if (msg.role === 'assistant') {
+                    text += `【模型回复】\n${rawContent}`;
+                  } else if (msg.role === 'tool') {
+                    const toolName = msg.name ? `[${msg.name}]` : '';
+                    text += `【工具信息 ${toolName}】\n${rawContent}`;
+                  }
+                }
+                needTools = userMentionsTools;
+              }
+
+              // ★ 按需拼接工具列表（只有用户提及"工具"才带）
+              if (needTools) {
+                text = `【可用工具】\n${toolsText}${instruction}\n\n${text}`;
+              }
+
+              return text;
+            }
+
+            const promptText = buildPromptText(false, toolsText, toolCallInstructions);
+            const fullPromptText = buildPromptText(true, toolsText, toolCallInstructions);
+
+            // ★ 程序启动后第一次请求：服务端上下文为空，必须用完整历史建立上下文
+            //   之后依赖服务端上下文，用 promptText（system + 最新 user）
+            let actualPromptText = promptText;
+            if (isFirstRequestAfterStart) {
+              isFirstRequestAfterStart = false;
+              // 只有 messages 里有实质历史（> system + 1 user）时才需要切换
+              // 新任务场景（只有 system + 1 user）两者等价，无需特别处理
+              if (messages.length > 2) {
+                console.log('[启动] 首次请求检测到历史消息，使用完整历史 prompt 建立上下文');
+                actualPromptText = fullPromptText;
+              }
+            }
+            console.log(`[HTTP] prompt 模式：${actualPromptText === fullPromptText ? '完整历史' : '旧会话极简'} ${actualPromptText.length} 字符 / 完整版 ${fullPromptText.length} 字符`);
+
+            console.log('[HTTP] 收到消息:', userMsg.slice(0, 50), '...');
             // ===== 流式基础设施：data.stream === true 时，提前设置响应头 + onDelta =====
             let streamCtx = null;
             if (data.stream === true) {
@@ -2431,17 +2433,9 @@ async function main() {
 
             // 真正流式：无工具 + 流式请求时，正文边接收边返回
             if (data.stream === true && tools.length === 0) {
-              // ★ 与 getFinalReplyWithTools 中保持一致的「纯工具增量」判断：
-              //   用 endsWith 替代 includes，避免工具返回内容里恰好包含
-              //   【系统提示】/【用户消息】字面量导致误判。
-              const isPureToolIncrementStream =
-                actualPromptText.startsWith('【工具执行结果') &&
-                actualPromptText.endsWith('请基于上述工具执行结果继续回答。\n');
-
-              const streamPrompt = isPureToolIncrementStream
-                ? actualPromptText
-                : `【可用工具】\n无\n\n${actualPromptText}`;
-              const streamFullPrompt = `【可用工具】\n无\n\n${fullPromptText}`;
+              // ★ actualPromptText / fullPromptText 已由 buildPromptText 按需拼接好工具列表，直接用
+              const streamPrompt = actualPromptText;
+              const streamFullPrompt = fullPromptText;
               await new Promise(r => setTimeout(r, 10000));
               await sendAndWait(streamPrompt, cancelState, streamCtx.onDelta, 0, streamFullPrompt);
               // ★ 把流式缓冲区里最后的内容吐出来（尾部半截 '<...' 会被强制丢弃）
@@ -2458,7 +2452,7 @@ async function main() {
             }
 
             const { toolCall, toolCalls, rawOutput, assistantContent, emittedContent } = await getFinalReplyWithTools(
-              actualPromptText, fullPromptText, toolsText, toolCallInstructions, toolNames, toolSchemas, cancelState,
+              actualPromptText, fullPromptText, toolNames, toolSchemas, cancelState,
               streamCtx ? streamCtx.onDelta : null
             );
 
