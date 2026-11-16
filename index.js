@@ -2179,35 +2179,28 @@ async function main() {
     `  （每个参数的开标签、值、闭合标签必须各自成对，不得跨参数合并）\n`
   : '';
 
-            // ★ 新逻辑：
-            //   1) 只有"最后一条 user 消息"包含"工具"字眼（中文"工具"或英文 tool/tools），
-            //      才在 prompt 开头拼接【可用工具】+ 工具说明；
-            //   2) 纯工具回调（hasTool && !hasUser）绝不带工具列表、绝不带任何引导语，
-            //      只发【工具执行结果 ...】；
-            //   3) 其他情况（首轮/兜底/完整历史），也按"用户是否提及工具"决定。
+            // ★ 按需拼接工具列表（只有用户提及"工具"才带）
+            //   - sections 收集完成后，单节 → 去标签；多节 → 保留【xxx】分隔
             function buildPromptText(includeFullHistory, toolsText, instruction) {
-              let text = "";
+              let text;                      // ★ 提前声明，避免完整历史分支赋值时 TDZ 报错
+              const sections = [];           // { label, content }
               let needTools = false;
-              // ★ 判断用户消息是否提及"工具"字眼（不区分大小写；匹配"工具"/"tool"/"tools"）
               const userMentionsTools = /工具|tools?/i.test(userMsg);
 
               if (!includeFullHistory) {
-                // 1. 找到最后一条 assistant 的索引（代表上一次模型的输出/工具调用指令）
+                // 1. 找到最后一条 assistant
                 let lastAssistantIdx = -1;
                 for (let i = messages.length - 1; i >= 0; i--) {
-                  if (messages[i].role === 'assistant') {
-                    lastAssistantIdx = i;
-                    break;
-                  }
+                  if (messages[i].role === 'assistant') { lastAssistantIdx = i; break; }
                 }
 
-                // 2. 从最后一条 assistant 之后提取所有的增量内容
+                // 2. 从最后一条 assistant 之后提取增量
                 const incrementalMsgs = [];
                 for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
                   incrementalMsgs.push(messages[i]);
                 }
 
-                // 3. 判断是否有实际的增量输入
+                // 3. 判断是否有实际增量
                 const hasTool = incrementalMsgs.some(m => m.role === 'tool');
                 const hasUser = incrementalMsgs.some(m => m.role === 'user');
 
@@ -2215,48 +2208,44 @@ async function main() {
                   // 场景 A：服务端无历史（第一轮对话）
                   for (const msg of messages) {
                     if (msg.role === 'system') {
-                      const rawContent = extractTextContent(msg.content);
-                      text += `【系统提示】\n${rawContent}`;
+                      sections.push({ label: '系统提示', content: extractTextContent(msg.content) });
                     }
                   }
                   if (userMsg) {
-                    text += `【用户消息】\n${userMsg}`;
+                    sections.push({ label: '用户消息', content: userMsg });
                   }
                   needTools = userMentionsTools;
                 } else if (hasTool || hasUser) {
                   // 场景 B：多轮对话包含工具回调或新提示
                   for (const msg of incrementalMsgs) {
                     if (msg.role === 'tool') {
-                      const content = extractTextContent(msg.content);
                       const toolName = msg.name ? `[${msg.name}]` : '';
-                      text += `【工具执行结果 ${toolName}】\n${content}\n\n`;
+                      sections.push({ label: `工具执行结果 ${toolName}`, content: extractTextContent(msg.content) });
                     } else if (msg.role === 'user') {
-                      const content = extractTextContent(msg.content);
-                      text += `【用户消息】\n${content}\n\n`;
+                      sections.push({ label: '用户消息', content: extractTextContent(msg.content) });
                     }
                   }
                   if (hasTool && !hasUser) {
                     // ★ 纯工具回调：只发工具结果，不带任何前缀、引导语、工具列表
                     needTools = false;
                   } else {
-                    // ★ 有新 user 消息：用户提及"工具"才带工具列表
                     needTools = userMentionsTools;
                   }
                 } else {
                   // 场景 C：兜底
                   for (const msg of messages) {
                     if (msg.role === 'system') {
-                      const rawContent = extractTextContent(msg.content);
-                      text += `【系统提示】\n${rawContent}`;
+                      sections.push({ label: '系统提示', content: extractTextContent(msg.content) });
                     }
                   }
                   if (userMsg) {
-                    text += `【用户消息】\n${userMsg}`;
+                    sections.push({ label: '用户消息', content: userMsg });
                   }
                   needTools = userMentionsTools;
                 }
               } else {
-                // ★ 新会话完整历史：拼接所有消息
+                // ★ 新会话完整历史：聊天记录风格（[用户]/[助手] 前缀），比【xxx】\n 更紧凑
+                const lines = [];
                 for (const msg of messages) {
                   let rawContent = extractTextContent(msg.content);
                   if (msg.role === 'assistant') {
@@ -2266,17 +2255,45 @@ async function main() {
                       .join('\n');
                   }
                   if (msg.role === 'system') {
-                    text += `【系统提示】\n${rawContent}`;
+                    if (rawContent) lines.push(`[系统指令]\n${rawContent}`);
                   } else if (msg.role === 'user') {
-                    text += `【用户消息】\n${rawContent}`;
+                    lines.push(`[用户] ${rawContent}`);
                   } else if (msg.role === 'assistant') {
-                    text += `【模型回复】\n${rawContent}`;
+                    lines.push(`[助手] ${rawContent}`);
                   } else if (msg.role === 'tool') {
                     const toolName = msg.name ? `[${msg.name}]` : '';
-                    text += `【工具信息 ${toolName}】\n${rawContent}`;
+                    lines.push(`[工具返回${toolName}]\n${rawContent}`);
                   }
                 }
+                text = lines.join('\n\n');
                 needTools = userMentionsTools;
+                // ★ 完整历史已直接产出 text，跳过下方 sections 逻辑
+                return needTools
+                  ? `【可用工具】\n${toolsText}${instruction}\n\n${text}`
+                  : text;
+              }
+
+              // ★ 单节 → 直接输出内容；多节 → 保留【xxx】分隔
+              //   - 例外：单节为工具结果时必须保留【工具执行结果 [name]】标识，
+              //     否则模型无法区分"工具返回的值"和"用户新输入"，
+              //     会把 JSON / 文件内容当作用户消息，或幻觉出续写内容
+              //   （注意：这里不需要再写 let text; 了，因为函数最顶部已经声明过了）
+              if (sections.length === 0) {
+                text = '';
+              } else if (sections.length === 1) {
+                const s = sections[0];
+                if (s.label.startsWith('工具')) {
+                  text = `【${s.label}】\n${s.content}`;
+                } else {
+                  text = s.content;
+                }
+              } else {
+                // ★ 多节拼接：user 消息裸输出（更自然），其余保留【xxx】分隔
+                text = sections.map(s =>
+                  s.label === '用户消息'
+                    ? s.content
+                    : `【${s.label}】\n${s.content}`
+                ).join('\n\n');
               }
 
               // ★ 按需拼接工具列表（只有用户提及"工具"才带）
