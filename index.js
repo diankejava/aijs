@@ -2047,9 +2047,9 @@ async function main() {
 
           // ★ 极简版：只发错误位置，不发任何示例/规则
           const retryPrompt =
-            `【工具调用格式错误】\n` +
+            `你上次的输出存在格式错误。\n` +
             `错误详情：\n${parseResult.error}\n\n` +
-            `请重新输出完整的工具调用。`;
+            `请重新输出完整的工具调用，不要输出其他无关内容。`;
 
           // ★ 发送纠正提示前先等 10 秒：
           //   - 给页面一个渲染/输入框恢复的缓冲窗口，避免上一轮刚结束就立刻输入
@@ -2219,8 +2219,7 @@ async function main() {
                   // 场景 B：多轮对话包含工具回调或新提示
                   for (const msg of incrementalMsgs) {
                     if (msg.role === 'tool') {
-                      const toolName = msg.name ? `[${msg.name}]` : '';
-                      sections.push({ label: `工具执行结果 ${toolName}`, content: extractTextContent(msg.content) });
+                      sections.push({ label: '工具结果', content: extractTextContent(msg.content) });
                     } else if (msg.role === 'user') {
                       sections.push({ label: '用户消息', content: extractTextContent(msg.content) });
                     }
@@ -2261,8 +2260,7 @@ async function main() {
                   } else if (msg.role === 'assistant') {
                     lines.push(`[助手] ${rawContent}`);
                   } else if (msg.role === 'tool') {
-                    const toolName = msg.name ? `[${msg.name}]` : '';
-                    lines.push(`[工具返回${toolName}]\n${rawContent}`);
+                    lines.push(rawContent);
                   }
                 }
                 text = lines.join('\n\n');
@@ -2273,27 +2271,19 @@ async function main() {
                   : text;
               }
 
-              // ★ 单节 → 直接输出内容；多节 → 保留【xxx】分隔
-              //   - 例外：单节为工具结果时必须保留【工具执行结果 [name]】标识，
-              //     否则模型无法区分"工具返回的值"和"用户新输入"，
-              //     会把 JSON / 文件内容当作用户消息，或幻觉出续写内容
-              //   （注意：这里不需要再写 let text; 了，因为函数最顶部已经声明过了）
+              // ★ 单节 → 直接裸输出；多节 → 保留【xxx】分隔
               if (sections.length === 0) {
                 text = '';
               } else if (sections.length === 1) {
-                const s = sections[0];
-                if (s.label.startsWith('工具')) {
-                  text = `【${s.label}】\n${s.content}`;
-                } else {
-                  text = s.content;
-                }
+                text = sections[0].content;
               } else {
-                // ★ 多节拼接：user 消息裸输出（更自然），其余保留【xxx】分隔
-                text = sections.map(s =>
-                  s.label === '用户消息'
-                    ? s.content
-                    : `【${s.label}】\n${s.content}`
-                ).join('\n\n');
+                // ★ 多节拼接：除了系统提示，全部自然裸输出
+                text = sections.map(s => {
+                  if (s.label === '系统提示') {
+                    return `【系统提示】\n${s.content}`;
+                  }
+                  return s.content;
+                }).join('\n\n');
               }
 
               // ★ 按需拼接工具列表（只有用户提及"工具"才带）
