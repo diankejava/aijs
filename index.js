@@ -335,13 +335,6 @@ async function main() {
   browser = initResult.browser;
   page = initResult.page;
 
-  // ★ 程序启动后第一次请求标志：
-  //   - 程序刚启动时 DeepSeek 停在新对话界面，服务端上下文为空
-  //   - 此时如果客户端发完整历史，必须用 fullPromptText（完整历史）建立上下文
-  //   - 之后依赖服务端上下文，用 promptText（system + 最新 user）
-  //   - 超限切换新对话后，由 limitExceeded 分支用 fullText 重发（已有逻辑）
-  let isFirstRequestAfterStart = true;
-
   async function findEditor() {
     const selectors = platform.editor.split(',').map(s => s.trim());
     for (const sel of selectors) {
@@ -2179,44 +2172,42 @@ async function main() {
     `  （每个参数的开标签、值、闭合标签必须各自成对，不得跨参数合并）\n`
   : '';
 
-            // ★ 按需拼接工具列表（只有用户提及"工具"才带）
-            //   - sections 收集完成后，单节 → 去标签；多节 → 保留【xxx】分隔
+            // ★ 按需拼接工具列表（系统提示和工具将绑定在一起）
             function buildPromptText(includeFullHistory, toolsText, instruction) {
-              let text;                      // ★ 提前声明，避免完整历史分支赋值时 TDZ 报错
-              const sections = [];           // { label, content }
+              let text;
+              const sections = [];
               let needTools = false;
               const userMentionsTools = /工具|tools?/i.test(userMsg);
 
+              // ★ 提取所有系统消息，统一放到最前面拼，不再放进 sections 避免格式混乱
+              let systemContent = '';
+              for (const msg of messages) {
+                if (msg.role === 'system') {
+                  systemContent += extractTextContent(msg.content).trim() + '\n\n';
+                }
+              }
+              systemContent = systemContent.trim();
+
               if (!includeFullHistory) {
-                // 1. 找到最后一条 assistant
                 let lastAssistantIdx = -1;
                 for (let i = messages.length - 1; i >= 0; i--) {
                   if (messages[i].role === 'assistant') { lastAssistantIdx = i; break; }
                 }
 
-                // 2. 从最后一条 assistant 之后提取增量
                 const incrementalMsgs = [];
                 for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
                   incrementalMsgs.push(messages[i]);
                 }
 
-                // 3. 判断是否有实际增量
                 const hasTool = incrementalMsgs.some(m => m.role === 'tool');
                 const hasUser = incrementalMsgs.some(m => m.role === 'user');
 
                 if (lastAssistantIdx === -1) {
-                  // 场景 A：服务端无历史（第一轮对话）
-                  for (const msg of messages) {
-                    if (msg.role === 'system') {
-                      sections.push({ label: '系统提示', content: extractTextContent(msg.content) });
-                    }
-                  }
-                  if (userMsg) {
-                    sections.push({ label: '用户消息', content: userMsg });
-                  }
+                  // 场景 A：首轮
+                  if (userMsg) sections.push({ label: '用户消息', content: userMsg });
                   needTools = userMentionsTools;
                 } else if (hasTool || hasUser) {
-                  // 场景 B：多轮对话包含工具回调或新提示
+                  // 场景 B：多轮增量
                   for (const msg of incrementalMsgs) {
                     if (msg.role === 'tool') {
                       sections.push({ label: '工具结果', content: extractTextContent(msg.content) });
@@ -2225,25 +2216,39 @@ async function main() {
                     }
                   }
                   if (hasTool && !hasUser) {
-                    // ★ 纯工具回调：只发工具结果，不带任何前缀、引导语、工具列表
                     needTools = false;
                   } else {
                     needTools = userMentionsTools;
                   }
                 } else {
                   // 场景 C：兜底
-                  for (const msg of messages) {
-                    if (msg.role === 'system') {
-                      sections.push({ label: '系统提示', content: extractTextContent(msg.content) });
-                    }
-                  }
-                  if (userMsg) {
-                    sections.push({ label: '用户消息', content: userMsg });
-                  }
+                  if (userMsg) sections.push({ label: '用户消息', content: userMsg });
                   needTools = userMentionsTools;
                 }
+
+                // 裸输出拼接
+                if (sections.length === 0) {
+                  text = '';
+                } else if (sections.length === 1) {
+                  text = sections[0].content;
+                } else {
+                  text = sections.map(s => s.content).join('\n\n');
+                }
+
+                // ★ 统一组装前缀
+                let prefix = '';
+                // 逻辑：完全根据用户是否提及“工具”来决定是否带系统提示和工具说明
+                if (needTools) {
+                  if (systemContent) {
+                    prefix += `【系统提示】\n${systemContent}\n\n`;
+                  }
+                  prefix += `【可用工具】\n${toolsText}${instruction}\n\n`;
+                }
+                
+                return prefix + text;
+
               } else {
-                // ★ 新会话完整历史：聊天记录风格（[用户]/[助手] 前缀），比【xxx】\n 更紧凑
+                // ★ 完整历史模式
                 const lines = [];
                 for (const msg of messages) {
                   let rawContent = extractTextContent(msg.content);
@@ -2253,8 +2258,9 @@ async function main() {
                       .filter(line => !historyNoise.test(line.trim()))
                       .join('\n');
                   }
+                  
                   if (msg.role === 'system') {
-                    if (rawContent) lines.push(`[系统指令]\n${rawContent}`);
+                    // 跳过，统一在 prefix 里加
                   } else if (msg.role === 'user') {
                     lines.push(`[用户] ${rawContent}`);
                   } else if (msg.role === 'assistant') {
@@ -2265,49 +2271,28 @@ async function main() {
                 }
                 text = lines.join('\n\n');
                 needTools = userMentionsTools;
-                // ★ 完整历史已直接产出 text，跳过下方 sections 逻辑
-                return needTools
-                  ? `【可用工具】\n${toolsText}${instruction}\n\n${text}`
-                  : text;
-              }
 
-              // ★ 单节 → 直接裸输出；多节 → 保留【xxx】分隔
-              if (sections.length === 0) {
-                text = '';
-              } else if (sections.length === 1) {
-                text = sections[0].content;
-              } else {
-                // ★ 多节拼接：除了系统提示，全部自然裸输出
-                text = sections.map(s => {
-                  if (s.label === '系统提示') {
-                    return `【系统提示】\n${s.content}`;
+                let prefix = '';
+                // 即使是完整历史，也严格根据用户是否提“工具”来决定是否带系统提示
+                if (needTools) {
+                  if (systemContent) {
+                    prefix += `【系统提示】\n${systemContent}\n\n`;
                   }
-                  return s.content;
-                }).join('\n\n');
+                  prefix += `【可用工具】\n${toolsText}${instruction}\n\n`;
+                }
+                return prefix + text;
               }
-
-              // ★ 按需拼接工具列表（只有用户提及"工具"才带）
-              if (needTools) {
-                text = `【可用工具】\n${toolsText}${instruction}\n\n${text}`;
-              }
-
-              return text;
             }
 
             const promptText = buildPromptText(false, toolsText, toolCallInstructions);
             const fullPromptText = buildPromptText(true, toolsText, toolCallInstructions);
 
-            // ★ 程序启动后第一次请求：服务端上下文为空，必须用完整历史建立上下文
-            //   之后依赖服务端上下文，用 promptText（system + 最新 user）
+            // ★ 根据用户是否明确提及“历史/之前”来决定是否发送完整历史，不再依赖程序启动状态
+            const mentionsHistory = /历史|上文|回顾|对话记录/i.test(userMsg);
             let actualPromptText = promptText;
-            if (isFirstRequestAfterStart) {
-              isFirstRequestAfterStart = false;
-              // 只有 messages 里有实质历史（> system + 1 user）时才需要切换
-              // 新任务场景（只有 system + 1 user）两者等价，无需特别处理
-              if (messages.length > 2) {
-                console.log('[启动] 首次请求检测到历史消息，使用完整历史 prompt 建立上下文');
-                actualPromptText = fullPromptText;
-              }
+            if (mentionsHistory) {
+              console.log('[HTTP] 用户提及历史/上下文，自动切换为完整历史 prompt');
+              actualPromptText = fullPromptText;
             }
             console.log(`[HTTP] prompt 模式：${actualPromptText === fullPromptText ? '完整历史' : '旧会话极简'} ${actualPromptText.length} 字符 / 完整版 ${fullPromptText.length} 字符`);
 
