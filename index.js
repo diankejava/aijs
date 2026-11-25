@@ -1976,8 +1976,9 @@ async function main() {
       } : null;
 
       // ★ promptText / fullPromptText 已由 buildPromptText 按需拼接好工具列表：
-      //   - 用户消息里提及"工具"字眼 → 已带【可用工具】+ 工具说明
-      //   - 纯工具回调 / 用户未提及"工具" → 只发用户消息或工具结果，不带工具列表
+      //   - 用户消息里提及"工具"字眼且 tools.length > 0 → 已带【可用工具】+ 工具说明
+      //   - 纯工具回调 / 用户未提及"工具" / tools.length === 0 → 只发用户消息或工具结果，不带工具列表
+      //   - 当前策略：tools.length === 0 时连【系统提示】也不拼（需 needTools 且 tools.length > 0 才拼）
       //   所以这里直接使用，不再二次拼接。
       //   （原 toolsText / instruction 参数已上移到 buildPromptText，此处不再接收）
       let prompt = promptText;
@@ -1991,7 +1992,7 @@ async function main() {
 
       // 无论是否声明了工具，只要回复中包含了工具调用标签，就尝试解析或纠正
       if (parseResult.found) {
-        // ★ 有上限的纠正循环（最多 2 次），并带 DSML 泛滥 / 重复输出检测
+        // ★ 有上限的纠正循环（最多 30 次），并带 DSML 泛滥 / 重复输出检测
         let correctionAttempts = 0;
         const MAX_CORRECTIONS = 30;
         let prevOutput = '';
@@ -2130,6 +2131,28 @@ async function main() {
             let userMsg = userMsgs.length ? extractTextContent(userMsgs[userMsgs.length - 1].content) : '';
             const tools = data.tools || [];
             const toolNames = tools.map(t => t.function.name);
+
+            // ★ 检测客户端直发指令：最后一条消息既不是 user 也不是 tool
+            //   典型场景：Hermes 发送更新 skill 的 system 指令。
+            //   命中时只把这条消息内容作为 prompt 发给模型，不拼接工具说明/历史。
+            const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+            const isDirectiveMsg = !!lastMsg && lastMsg.role !== 'user' && lastMsg.role !== 'tool';
+
+            // ★ 提前计算是否处于工具回传阶段（只要上一条大模型回复包含工具调用，当前就是回传阶段）
+            let lastAssistantIdx = -1;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if (messages[i].role === 'assistant') { lastAssistantIdx = i; break; }
+            }
+            let isAfterToolCall = false;
+            if (lastAssistantIdx !== -1) {
+              const lastAsst = messages[lastAssistantIdx];
+              if (
+                (lastAsst.tool_calls && lastAsst.tool_calls.length > 0) ||
+                (lastAsst.content && (lastAsst.content.includes('<invoke') || lastAsst.content.includes('｜｜DSML｜｜')))
+              ) {
+                isAfterToolCall = true;
+              }
+            }
             // ★ 构建 name → schema 的映射，用于参数语义校验
             const toolSchemas = {};
             for (const t of tools) {
@@ -2139,7 +2162,7 @@ async function main() {
             }
 
             console.log('[HTTP] 可用工具:', toolNames.join(', '));
-            if (!userMsg) {
+            if (!userMsg && !isDirectiveMsg) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: { message: 'No message content', type: 'invalid_request_error' } }));
               return;
@@ -2150,7 +2173,7 @@ async function main() {
             // ★ toolsText / toolCallInstructions 需要提前定义，供 buildPromptText 内部按需拼接
             const toolsText = tools.length > 0
               ? tools.map(t => `- ${t.function.name}: ${t.function.description}`).join('\n')
-              : '无';
+              : '';
             const toolCallInstructions = tools.length > 0
   ? `\n\n【工具调用格式（必须严格遵守）】\n` +
     `格式：<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name="工具名"> <｜｜DSML｜｜ parameter name="参数名">值</｜｜DSML｜｜ parameter> </｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>\n` +
@@ -2177,10 +2200,8 @@ async function main() {
               let text;
               const sections = [];
               let needTools = false;
-              // ★ 收紧正则：必须明确要求“用/使用/调用 工具”才算，防止被工具结果或普通聊天里的“工具”二字误伤
               const userMentionsTools = /(用|使用|调用|执行).*(工具|tool)|tool.*call/i.test(userMsg);
 
-              // ★ 提取所有系统消息，统一放到最前面拼，不再放进 sections 避免格式混乱
               let systemContent = '';
               for (const msg of messages) {
                 if (msg.role === 'system') {
@@ -2190,11 +2211,6 @@ async function main() {
               systemContent = systemContent.trim();
 
               if (!includeFullHistory) {
-                let lastAssistantIdx = -1;
-                for (let i = messages.length - 1; i >= 0; i--) {
-                  if (messages[i].role === 'assistant') { lastAssistantIdx = i; break; }
-                }
-
                 const incrementalMsgs = [];
                 for (let i = lastAssistantIdx + 1; i < messages.length; i++) {
                   incrementalMsgs.push(messages[i]);
@@ -2204,11 +2220,9 @@ async function main() {
                 const hasUser = incrementalMsgs.some(m => m.role === 'user');
 
                 if (lastAssistantIdx === -1) {
-                  // 场景 A：首轮
                   if (userMsg) sections.push({ label: '用户消息', content: userMsg });
-                  needTools = userMentionsTools;
+                  needTools = userMentionsTools && !isAfterToolCall; // ★
                 } else if (hasTool || hasUser) {
-                  // 场景 B：多轮增量
                   for (const msg of incrementalMsgs) {
                     if (msg.role === 'tool') {
                       sections.push({ label: '工具结果', content: extractTextContent(msg.content) });
@@ -2216,32 +2230,16 @@ async function main() {
                       sections.push({ label: '用户消息', content: extractTextContent(msg.content) });
                     }
                   }
-
-                  // ★ 只要上一条 assistant 包含工具调用，说明当前请求必定是工具结果回传阶段
-                  let isAfterToolCall = false;
-                  if (lastAssistantIdx !== -1) {
-                    const lastAsst = messages[lastAssistantIdx];
-                    if (
-                      (lastAsst.tool_calls && lastAsst.tool_calls.length > 0) || 
-                      (lastAsst.content && lastAsst.content.includes('<invoke'))
-                    ) {
-                      isAfterToolCall = true;
-                    }
-                  }
-
                   if (hasTool || isAfterToolCall) {
-                    // 只要有 tool 消息，或者紧随上一次工具调用，强制不带系统提示和工具定义！
                     needTools = false;
                   } else {
                     needTools = userMentionsTools;
                   }
                 } else {
-                  // 场景 C：兜底
                   if (userMsg) sections.push({ label: '用户消息', content: userMsg });
                   needTools = userMentionsTools;
                 }
 
-                // 裸输出拼接
                 if (sections.length === 0) {
                   text = '';
                 } else if (sections.length === 1) {
@@ -2250,32 +2248,21 @@ async function main() {
                   text = sections.map(s => s.content).join('\n\n');
                 }
 
-                // ★ 统一组装前缀
                 let prefix = '';
-                // 逻辑：完全根据用户是否提及“工具”来决定是否带系统提示和工具说明
-                if (needTools) {
-                  if (systemContent) {
-                    prefix += `【系统提示】\n${systemContent}\n\n`;
-                  }
+                if (needTools && tools.length > 0) {
+                  if (systemContent) prefix += `【系统提示】\n${systemContent}\n\n`;
                   prefix += `【可用工具】\n${toolsText}${instruction}\n\n`;
                 }
-                
                 return prefix + text;
-
               } else {
-                // ★ 完整历史模式
                 const lines = [];
                 for (const msg of messages) {
                   let rawContent = extractTextContent(msg.content);
                   if (msg.role === 'assistant') {
-                    rawContent = rawContent
-                      .split('\n')
-                      .filter(line => !historyNoise.test(line.trim()))
-                      .join('\n');
+                    rawContent = rawContent.split('\n').filter(line => !historyNoise.test(line.trim())).join('\n');
                   }
-                  
                   if (msg.role === 'system') {
-                    // 跳过，统一在 prefix 里加
+                    // skip
                   } else if (msg.role === 'user') {
                     lines.push(`[用户] ${rawContent}`);
                   } else if (msg.role === 'assistant') {
@@ -2285,31 +2272,40 @@ async function main() {
                   }
                 }
                 text = lines.join('\n\n');
-                needTools = userMentionsTools;
+                
+                // ★ 关键拦截：完整历史分支下，只要是工具回调，绝不带系统提示！
+                needTools = userMentionsTools && !isAfterToolCall;
 
                 let prefix = '';
-                // 即使是完整历史，也严格根据用户是否提“工具”来决定是否带系统提示
-                if (needTools) {
-                  if (systemContent) {
-                    prefix += `【系统提示】\n${systemContent}\n\n`;
-                  }
+                if (needTools && tools.length > 0) {
+                  if (systemContent) prefix += `【系统提示】\n${systemContent}\n\n`;
                   prefix += `【可用工具】\n${toolsText}${instruction}\n\n`;
                 }
                 return prefix + text;
               }
             }
+            let promptText;
+            let fullPromptText;
+            if (isDirectiveMsg) {
+              // ★ 客户端直发指令（如 Hermes 更新 skill）：只发送这条指令内容，
+              //   不拼接【系统提示】/【可用工具】/工具格式说明/历史消息。
+              const directiveContent = extractTextContent(lastMsg.content);
+              console.log('[HTTP] 检测到客户端直发指令（role=' + lastMsg.role + '），仅发送该指令，不注入工具/历史:', directiveContent.slice(0, 100));
+              promptText = directiveContent;
+              fullPromptText = directiveContent;
+            } else {
+              promptText = buildPromptText(false, toolsText, toolCallInstructions);
+              fullPromptText = buildPromptText(true, toolsText, toolCallInstructions);
+            }
 
-            const promptText = buildPromptText(false, toolsText, toolCallInstructions);
-            const fullPromptText = buildPromptText(true, toolsText, toolCallInstructions);
-
-            // ★ 根据用户是否明确提及“历史/之前”来决定是否发送完整历史，不再依赖程序启动状态
-            const mentionsHistory = /历史|上文|回顾|对话记录/i.test(userMsg);
+            // ★ 如果是工具回传阶段，绝不允许再次触发完整历史，否则会把几十万字重发一遍
+            const mentionsHistory = !isDirectiveMsg && /历史|上文|回顾|对话记录/i.test(userMsg) && !isAfterToolCall;
             let actualPromptText = promptText;
             if (mentionsHistory) {
               console.log('[HTTP] 用户提及历史/上下文，自动切换为完整历史 prompt');
               actualPromptText = fullPromptText;
             }
-            console.log(`[HTTP] prompt 模式：${actualPromptText === fullPromptText ? '完整历史' : '旧会话极简'} ${actualPromptText.length} 字符 / 完整版 ${fullPromptText.length} 字符`);
+            console.log(`[HTTP] prompt 模式：${isDirectiveMsg ? '客户端直发指令' : (actualPromptText === fullPromptText ? '完整历史' : '旧会话极简')} ${actualPromptText.length} 字符 / 完整版 ${fullPromptText.length} 字符`);
 
             console.log('[HTTP] 收到消息:', userMsg.slice(0, 50), '...');
             // ===== 流式基础设施：data.stream === true 时，提前设置响应头 + onDelta =====
