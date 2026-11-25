@@ -2177,7 +2177,8 @@ async function main() {
               let text;
               const sections = [];
               let needTools = false;
-              const userMentionsTools = /工具|tools?/i.test(userMsg);
+              // ★ 收紧正则：必须明确要求“用/使用/调用 工具”才算，防止被工具结果或普通聊天里的“工具”二字误伤
+              const userMentionsTools = /(用|使用|调用|执行).*(工具|tool)|tool.*call/i.test(userMsg);
 
               // ★ 提取所有系统消息，统一放到最前面拼，不再放进 sections 避免格式混乱
               let systemContent = '';
@@ -2215,7 +2216,21 @@ async function main() {
                       sections.push({ label: '用户消息', content: extractTextContent(msg.content) });
                     }
                   }
-                  if (hasTool && !hasUser) {
+
+                  // ★ 只要上一条 assistant 包含工具调用，说明当前请求必定是工具结果回传阶段
+                  let isAfterToolCall = false;
+                  if (lastAssistantIdx !== -1) {
+                    const lastAsst = messages[lastAssistantIdx];
+                    if (
+                      (lastAsst.tool_calls && lastAsst.tool_calls.length > 0) || 
+                      (lastAsst.content && lastAsst.content.includes('<invoke'))
+                    ) {
+                      isAfterToolCall = true;
+                    }
+                  }
+
+                  if (hasTool || isAfterToolCall) {
+                    // 只要有 tool 消息，或者紧随上一次工具调用，强制不带系统提示和工具定义！
                     needTools = false;
                   } else {
                     needTools = userMentionsTools;
